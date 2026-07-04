@@ -4,7 +4,7 @@ VGL 最小解释器 — 单文件，仅依赖标准库
 支持: canvas / bg / let / = / for / if / fn / return / pixel / stroke / render
       v0.3: while / break / seed / 比较 < > <= >= == != / 逻辑 and or not / bool
             tuple 索引 / tuple 广播 / bezier / qbezier / path / dot / length
-            pow / sqrt
+            pow / sqrt / 闭包（可变捕获）
       表达式: + - * /  元组  变量  函数调用  颜色字面量 #rgb  true/false  tuple[i]
       内建函数: rand(a,b)  int(x)  abs(x)  floor(x)  ceil(x)  sin(x)  cos(x)
                 min(a,b)  max(a,b)  bool(x)  pow(a,b)  sqrt(x)
@@ -548,6 +548,39 @@ class BreakSignal(Exception):
     pass
 
 
+class Environment:
+    """词法作用域环境链（§5.1, §5.2）。vars 为本层绑定，parent 指向外层。
+    顶层全局环境的 parent 为 None。"""
+    __slots__ = ('vars', 'parent')
+
+    def __init__(self, parent=None):
+        self.vars = {}
+        self.parent = parent
+
+    def find_env(self, name):
+        """返回 name 所在的 Environment；未找到返回 None。"""
+        env = self
+        while env is not None:
+            if name in env.vars:
+                return env
+            env = env.parent
+        return None
+
+
+class Closure:
+    """函数闭包对象（§5.3）。捕获定义时的词法环境，支持可变捕获。"""
+    __slots__ = ('name', 'params', 'body', 'def_env')
+
+    def __init__(self, name, params, body, def_env):
+        self.name = name
+        self.params = params
+        self.body = body
+        self.def_env = def_env
+
+    def __repr__(self):
+        return f'<closure {self.name}({",".join(self.params)})>'
+
+
 def _bool_fn(x):
     """bool(x) 内建: 0/0.0/false → False, 否则 True (§6.1, §4.2)"""
     if isinstance(x, bool):
@@ -612,7 +645,9 @@ class Interpreter:
         self.cw = 0
         self.ch = 0
         self.buf = None  # bytearray
-        self.globals = {}
+        self.globals = Environment(parent=None)  # v0.3: 词法作用域链根
+        # funcs 不再单独存储：fn 定义在全局 env 中创建 Closure 绑定，
+        # 闭包自带 def_env。保留 self.funcs 仅用于向后兼容旧式顶层 fn 调用检测。
         self.funcs = {}
         self.builtins = {
             'rand': lambda a, b: random.uniform(a, b),
@@ -711,22 +746,19 @@ class Interpreter:
             for i in range(0, len(self.buf), 3):
                 self.buf[i] = r; self.buf[i + 1] = g; self.buf[i + 2] = b
         elif isinstance(stmt, LetStmt):
-            env[stmt.name] = self.eval(stmt.expr, env)
+            env.vars[stmt.name] = self.eval(stmt.expr, env)
         elif isinstance(stmt, AssignStmt):
-            # 裸赋值（§3.2.3）：仅修改已存在绑定，不创建新绑定
-            # 当前实现为单 env 模型（无作用域链），先查 env 再查 globals
-            if stmt.name in env:
-                env[stmt.name] = self.eval(stmt.expr, env)
-            elif stmt.name in self.globals:
-                self.globals[stmt.name] = self.eval(stmt.expr, env)
-            else:
+            # 裸赋值（§3.2.3）：仅修改已存在绑定，沿词法作用域链查找
+            target = env.find_env(stmt.name)
+            if target is None:
                 raise NameError(f'赋值给未声明变量: {stmt.name}（应使用 let 声明）')
+            target.vars[stmt.name] = self.eval(stmt.expr, env)
         elif isinstance(stmt, ForStmt):
             start = self.eval(stmt.start, env)
             end = self.eval(stmt.end, env)
             i = start
             while i < end:
-                env[stmt.var] = i
+                env.vars[stmt.var] = i
                 try:
                     for s in stmt.body:
                         self.exec(s, env)
@@ -752,7 +784,11 @@ class Interpreter:
                 for s in stmt.else_body:
                     self.exec(s, env)
         elif isinstance(stmt, FnDef):
-            self.funcs[stmt.name] = (stmt.params, stmt.body)
+            # v0.3 闭包：捕获定义时环境 def_env（§5.3）
+            closure = Closure(stmt.name, stmt.params, stmt.body, env)
+            env.vars[stmt.name] = closure
+            # 兼容：顶层 fn 也注册到 self.funcs（保留旧路径，便于 Call 优先查闭包）
+            self.funcs[stmt.name] = (stmt.params, stmt.body, env)
         elif isinstance(stmt, ReturnStmt):
             raise ReturnSignal(self.eval(stmt.expr, env) if stmt.expr else None)
         elif isinstance(stmt, PixelStmt):
@@ -881,11 +917,11 @@ class Interpreter:
         if isinstance(expr, ColorLit):
             return (expr.r, expr.g, expr.b)
         if isinstance(expr, VarRef):
-            if expr.name in env:
-                return env[expr.name]
-            if expr.name in self.globals:
-                return self.globals[expr.name]
-            raise NameError(f'未定义变量: {expr.name}')
+            # v0.3: 沿词法作用域链查找（§5.2）
+            target = env.find_env(expr.name)
+            if target is None:
+                raise NameError(f'未定义变量: {expr.name}')
+            return target.vars[expr.name]
         if isinstance(expr, TupleLit):
             return tuple(self.eval(e, env) for e in expr.elements)
         if isinstance(expr, BinOp):
@@ -939,25 +975,37 @@ class Interpreter:
             name = expr.name
             arg_vals = [self.eval(a, env) for a in expr.args]
             kw_vals = {k: self.eval(v, env) for k, v in expr.kwargs.items()}
-            # 用户函数
+            # v0.3 优先：沿词法作用域链查找闭包（支持 let walk = ...; walk()）
+            target_env = env.find_env(name)
+            if target_env is not None and isinstance(target_env.vars[name], Closure):
+                closure = target_env.vars[name]
+                return self._invoke_closure(closure, arg_vals, kw_vals)
+            # 兼容路径：顶层 fn 注册的 self.funcs（元组形式 params/body/def_env）
             if name in self.funcs:
-                params, body = self.funcs[name]
-                call_env = {}
-                for i, p in enumerate(params):
-                    if i < len(arg_vals):
-                        call_env[p] = arg_vals[i]
-                call_env.update(kw_vals)
-                try:
-                    for s in body:
-                        self.exec(s, call_env)
-                except ReturnSignal as ret:
-                    return ret.value
-                return None
+                params, body, def_env = self.funcs[name]
+                closure = Closure(name, params, body, def_env)
+                return self._invoke_closure(closure, arg_vals, kw_vals)
             # 内建函数
             if name in self.builtins:
                 return self.builtins[name](*arg_vals)
             raise NameError(f'未定义函数: {name}')
         raise RuntimeError(f'未知表达式类型: {type(expr).__name__}')
+
+    def _invoke_closure(self, closure, arg_vals, kw_vals):
+        """调用闭包：创建新 call_env，parent 指向闭包的 def_env（§5.3）。
+        参数绑定后执行函数体，捕获 ReturnSignal 返回值。"""
+        call_env = Environment(parent=closure.def_env)
+        for i, p in enumerate(closure.params):
+            if i < len(arg_vals):
+                call_env.vars[p] = arg_vals[i]
+        for k, v in kw_vals.items():
+            call_env.vars[k] = v
+        try:
+            for s in closure.body:
+                self.exec(s, call_env)
+        except ReturnSignal as ret:
+            return ret.value
+        return None
 
 
 # ============================================================
