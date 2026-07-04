@@ -78,7 +78,41 @@ KEYWORDS = {'canvas', 'bg', 'let', 'for', 'in', 'if', 'else', 'fn', 'return',
             # v0.4 新增
             'continue',
             # v0.5 新增
-            'struct'}
+            'struct',
+            # v0.5 批次 B 新增
+            'import'}
+
+
+# ============================================================
+# v0.5 错误定位工具（§8.2 行号/列号/caret）
+# ============================================================
+
+def pos_to_linecol(src, pos):
+    """字符偏移 pos -> (行号, 列号), 均 1-based。pos 为 None 时返回 (None, None)。"""
+    if pos is None or pos < 0:
+        return (None, None)
+    line = src.count('\n', 0, pos) + 1
+    last_nl = src.rfind('\n', 0, pos)
+    col = pos - last_nl  # last_nl=-1 时 col=pos+1（行首为 1）
+    return (line, col)
+
+
+def format_error(msg, src, pos, filename):
+    """格式化错误信息: filename:line:col: msg\n  <源码行>\n  <caret>"""
+    line, col = pos_to_linecol(src, pos)
+    if line is None:
+        return f'{filename}: {msg}'
+    lines = src.split('\n')
+    src_line = lines[line - 1] if line - 1 < len(lines) else ''
+    caret = ' ' * (col - 1) + '^'
+    return f'{filename}:{line}:{col}: {msg}\n  {src_line}\n  {caret}'
+
+
+def vgl_error(exc_cls, msg, pos):
+    """构造带 vgl_pos 属性的异常（词法/语法/运行时通用）。"""
+    e = exc_cls(msg)
+    e.vgl_pos = pos
+    return e
 
 
 def tokenize(src):
@@ -115,7 +149,7 @@ def tokenize(src):
                 toks.append(Token('COLOR',
                     (int(h[0] * 2, 16), int(h[1] * 2, 16), int(h[2] * 2, 16)), i))
             else:
-                raise SyntaxError(f'非法颜色 #{h} 于位置 {i}')
+                raise vgl_error(SyntaxError, f'非法颜色 #{h}', i)
             i = j
             continue
         # 字符串（v0.5 支持 \n \t \\ \" \r \0 转义，§2.4.4）
@@ -139,7 +173,7 @@ def tokenize(src):
                     chars.append(src[j])
                     j += 1
             if j >= n:
-                raise SyntaxError(f'未终止的字符串于位置 {i}')
+                raise vgl_error(SyntaxError, '未终止的字符串', i)
             toks.append(Token('STRING', ''.join(chars), i))
             i = j + 1
             continue
@@ -194,7 +228,7 @@ def tokenize(src):
             toks.append(Token('OP', c, i))
             i += 1
             continue
-        raise SyntaxError(f'非法字符 {c!r} 于位置 {i}')
+        raise vgl_error(SyntaxError, f'非法字符 {c!r}', i)
     toks.append(Token('EOF', None, i))
     return toks
 
@@ -285,6 +319,9 @@ class StrokeStmt:
     def __init__(self, fields): self.fields = fields
 class RenderStmt:
     def __init__(self, filename): self.filename = filename
+class ImportStmt:
+    """v0.5 import "path" 模块导入（§3.2.14）。path 为相对当前文件的 .vgl 路径。"""
+    def __init__(self, path): self.path = path
 class ExprStmt:
     def __init__(self, expr): self.expr = expr
 
@@ -310,7 +347,9 @@ class Parser:
     def expect(self, ttype, val=None):
         t = self.peek()
         if t.type != ttype or (val is not None and t.value != val):
-            raise SyntaxError(f'期望 {ttype} {val}, 得到 {t.type} {t.value!r} 于位置 {t.pos}')
+            expected = ttype if val is None else f'{ttype} {val!r}'
+            got = t.type if t.value is None else f'{t.type} {t.value!r}'
+            raise vgl_error(SyntaxError, f'期望 {expected}, 得到 {got}', t.pos)
         return self.advance()
 
     def parse_program(self):
@@ -320,6 +359,16 @@ class Parser:
         return stmts
 
     def parse_stmt(self):
+        # v0.5: 记录语句起始位置用于错误定位（§8.2 行号/列号/caret）
+        start_pos = self.peek().pos
+        stmt = self._parse_stmt_impl()
+        try:
+            stmt.pos = start_pos
+        except Exception:
+            pass
+        return stmt
+
+    def _parse_stmt_impl(self):
         t = self.peek()
         # 带标签循环: IDENT ':' for/while ...（§3.2.9.1 带标签 break）
         if t.type == 'IDENT' and self.peek(1).type == 'COLON' \
@@ -343,6 +392,8 @@ class Parser:
                 'continue': self.parse_continue,
                 # v0.5 新增
                 'struct': self.parse_struct,
+                # v0.5 批次 B 新增
+                'import': self.parse_import,
             }
             if t.value in dispatch:
                 return dispatch[t.value]()
@@ -387,7 +438,7 @@ class Parser:
         if t.type == 'COLOR':
             self.advance()
             return ColorLit(t.value[0], t.value[1], t.value[2])
-        raise SyntaxError(f'期望颜色, 得到 {t.type} 于位置 {t.pos}')
+        raise vgl_error(SyntaxError, f'期望颜色, 得到 {t.type}', t.pos)
 
     def parse_let(self):
         self.expect('KEYWORD', 'let')
@@ -472,7 +523,7 @@ class Parser:
     def parse_continue(self):
         self.expect('KEYWORD', 'continue')
         if self.loop_depth == 0:
-            raise SyntaxError('continue 只能出现在 for / while 循环体内')
+            raise vgl_error(SyntaxError, 'continue 只能出现在 for / while 循环体内', self.peek().pos)
         return ContinueStmt()
 
     def parse_seed(self):
@@ -539,6 +590,12 @@ class Parser:
     def parse_render(self):
         self.expect('KEYWORD', 'render')
         return RenderStmt(self.expect('STRING').value)
+
+    def parse_import(self):
+        """v0.5 批次 B: import "path/file.vgl" 模块导入（§3.2.14）"""
+        self.expect('KEYWORD', 'import')
+        path_tok = self.expect('STRING')
+        return ImportStmt(path_tok.value)
 
     def parse_kwargs(self):
         """解析 key: val, key: val, ... 形式"""
@@ -663,7 +720,7 @@ class Parser:
             else:
                 node = VarRef(name)
         else:
-            raise SyntaxError(f'意外标记 {t.type} {t.value!r} 于位置 {t.pos}')
+            raise vgl_error(SyntaxError, f'意外标记 {t.type} {t.value!r}', t.pos)
         # 后缀索引: base[i]（§3.3.4），支持连续索引 a[i][j]
         while self.peek().type == 'LBRACKET':
             self.advance()
@@ -890,6 +947,13 @@ class Interpreter:
         self.funcs = {}
         # v0.5 struct 类型注册表：name -> StructDefn
         self.structs = {}
+        # v0.5 §8.2 错误定位：当前执行语句的字符偏移
+        self.current_pos = None
+        # v0.5 批次 B 模块导入（§3.2.14）
+        self.current_dir = None      # 当前文件所在目录（解析相对路径）
+        self.current_filename = None  # 当前文件名（错误信息）
+        self.current_src = None      # 当前源码（错误定位）
+        self.imported = set()        # 已导入文件绝对路径集合（去重 + 防循环）
         self.builtins = {
             'rand': lambda a, b: random.uniform(a, b),
             'int': int,
@@ -988,6 +1052,10 @@ class Interpreter:
     # --- 语句执行 ---
 
     def exec(self, stmt, env):
+        # v0.5 §8.2: 更新当前语句位置（用于运行时错误定位）
+        pos = getattr(stmt, 'pos', None)
+        if pos is not None:
+            self.current_pos = pos
         if isinstance(stmt, CanvasStmt):
             self.cw, self.ch = stmt.width, stmt.height
             self.buf = bytearray(self.cw * self.ch * 3)
@@ -1097,8 +1165,45 @@ class Interpreter:
         elif isinstance(stmt, RenderStmt):
             write_png(stmt.filename, self.cw, self.ch, self.buf)
             print(f'已渲染: {stmt.filename} ({self.cw}x{self.ch})')
+        elif isinstance(stmt, ImportStmt):
+            # v0.5 批次 B §3.2.14 模块导入
+            self._do_import(stmt.path)
         elif isinstance(stmt, ExprStmt):
             self.eval(stmt.expr, env)
+
+    def _do_import(self, path):
+        """v0.5 批次 B §3.2.14 模块导入：读取并执行目标 .vgl 文件，
+        将其顶层 fn/struct/let 定义注入当前全局环境。
+        路径相对当前文件目录；按绝对路径去重，自动防止循环导入。"""
+        full = os.path.abspath(os.path.join(self.current_dir or '.', path))
+        if full in self.imported:
+            return  # 已导入，跳过（去重 + 防循环）
+        self.imported.add(full)
+        try:
+            with open(full, encoding='utf-8') as f:
+                sub_src = f.read()
+        except OSError as e:
+            raise vgl_error(IOError, f'无法导入模块 {path}: {e}', self.current_pos)
+        # 切换文件上下文（错误定位 + 嵌套 import 路径解析）
+        old_dir, old_fn, old_src, old_pos = (
+            self.current_dir, self.current_filename, self.current_src, self.current_pos)
+        self.current_dir = os.path.dirname(full)
+        self.current_filename = full
+        self.current_src = sub_src
+        try:
+            sub_toks = tokenize(sub_src)
+            sub_ast = Parser(sub_toks).parse_program()
+            for s in sub_ast:
+                self.exec(s, self.globals)
+        except Exception:
+            # 异常时保留子文件上下文（current_src/filename 为子文件），
+            # 供 main 错误定位使用，不恢复到主文件
+            raise
+        # 正常完成，恢复主文件上下文
+        self.current_dir = old_dir
+        self.current_filename = old_fn
+        self.current_src = old_src
+        self.current_pos = old_pos
 
     def put_pixel(self, x, y, rgb):
         if 0 <= x < self.cw and 0 <= y < self.ch:
@@ -1106,6 +1211,17 @@ class Interpreter:
             self.buf[idx] = int(rgb[0]) & 0xff
             self.buf[idx + 1] = int(rgb[1]) & 0xff
             self.buf[idx + 2] = int(rgb[2]) & 0xff
+
+    def put_pixel_aa(self, x, y, r, g, b, alpha):
+        """v0.5 批次 B 抗锯齿像素：alpha∈[0,1]，与现有像素线性混合（§7.3 Wu）"""
+        if alpha <= 0:
+            return
+        if 0 <= x < self.cw and 0 <= y < self.ch:
+            idx = (y * self.cw + x) * 3
+            a = max(0.0, min(1.0, alpha))
+            self.buf[idx] = int(self.buf[idx] * (1 - a) + r * a) & 0xff
+            self.buf[idx + 1] = int(self.buf[idx + 1] * (1 - a) + g * a) & 0xff
+            self.buf[idx + 2] = int(self.buf[idx + 2] * (1 - a) + b * a) & 0xff
 
     def exec_stroke(self, stmt, env):
         # v0.4 块作用域：stroke 块创建子 Environment（§5.1，与 for/if 一致）
@@ -1177,33 +1293,118 @@ class Interpreter:
             self.draw_line(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]), width, r, g, b)
 
     def draw_line(self, x0, y0, x1, y1, w, r, g, b):
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        length = max(dx, dy, 1)
-        half = w // 2
-        for i in range(length + 1):
-            t = i / length
-            x = int(x0 + (x1 - x0) * t)
-            y = int(y0 + (y1 - y0) * t)
-            for ox in range(-half, half + 1):
-                for oy in range(-half, half + 1):
-                    self.put_pixel(x + ox, y + oy, (r, g, b))
+        """v0.5 批次 B §7.3：w<=1 用 Xiaolin Wu 抗锯齿直线；
+        w>1 用 Bresenham 主线 + 圆形笔刷（填充圆，粗线圆润）。"""
+        if w <= 1:
+            self._wu_line(x0, y0, x1, y1, r, g, b)
+        else:
+            for px, py in self._bresenham_points(x0, y0, x1, y1):
+                self._brush(px, py, w, r, g, b)
 
     def draw_circle(self, cx, cy, rad, w, r, g, b):
+        """v0.5 批次 B §7.3：中点圆算法画轮廓；w<=1 单像素，w>1 圆形笔刷。"""
         x, y, err = rad, 0, 0
-        half = w // 2
         while x >= y:
-            for ox in range(-half, half + 1):
-                for oy in range(-half, half + 1):
-                    for px, py in [(cx + x, cy + y), (cx + y, cy + x), (cx - y, cy + x),
-                                   (cx - x, cy + y), (cx - x, cy - y), (cx - y, cy - x),
-                                   (cx + y, cy - x), (cx + x, cy - y)]:
-                        self.put_pixel(px + ox, py + oy, (r, g, b))
+            for px, py in [(cx + x, cy + y), (cx + y, cy + x), (cx - y, cy + x),
+                           (cx - x, cy + y), (cx - x, cy - y), (cx - y, cy - x),
+                           (cx + y, cy - x), (cx + x, cy - y)]:
+                if w <= 1:
+                    self.put_pixel(px, py, (r, g, b))
+                else:
+                    self._brush(px, py, w, r, g, b)
             y += 1
             if err <= 0:
                 err += 2 * y + 1
             if err > 0:
                 x -= 1
                 err -= 2 * x + 1
+
+    @staticmethod
+    def _bresenham_points(x0, y0, x1, y1):
+        """Bresenham 整数直线算法，返回点列表（§7.3）。"""
+        points = []
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            points.append((x0, y0))
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+        return points
+
+    def _brush(self, cx, cy, w, r, g, b):
+        """以 (cx,cy) 为中心画直径 w 的填充圆笔刷（粗线圆润边缘）。"""
+        rad = w / 2.0
+        r2 = rad * rad
+        ri = int(rad) + 1
+        for dy in range(-ri, ri + 1):
+            for dx in range(-ri, ri + 1):
+                if dx * dx + dy * dy <= r2:
+                    self.put_pixel(cx + dx, cy + dy, (r, g, b))
+
+    def _wu_line(self, x0, y0, x1, y1, r, g, b):
+        """Xiaolin Wu 抗锯齿直线算法（width=1，§7.3 反走样）。"""
+        def ipart(x):
+            return int(x)
+        def fpart(x):
+            return x - int(x)
+        def rfpart(x):
+            return 1 - fpart(x)
+        steep = abs(y1 - y0) > abs(x1 - x0)
+        if steep:
+            x0, y0 = y0, x0
+            x1, y1 = y1, x1
+        if x0 > x1:
+            x0, x1 = x1, x0
+            y0, y1 = y1, y0
+        dx = x1 - x0
+        dy = y1 - y0
+        grad = dy / dx if dx != 0 else 1.0
+        # 第一个端点
+        xend = round(x0)
+        yend = y0 + grad * (xend - x0)
+        xgap = rfpart(x0 + 0.5)
+        xpxl1 = int(xend)
+        ypxl1 = ipart(yend)
+        if steep:
+            self.put_pixel_aa(ypxl1, xpxl1, r, g, b, rfpart(yend) * xgap)
+            self.put_pixel_aa(ypxl1 + 1, xpxl1, r, g, b, fpart(yend) * xgap)
+        else:
+            self.put_pixel_aa(xpxl1, ypxl1, r, g, b, rfpart(yend) * xgap)
+            self.put_pixel_aa(xpxl1, ypxl1 + 1, r, g, b, fpart(yend) * xgap)
+        intery = yend + grad
+        # 第二个端点
+        xend = round(x1)
+        yend = y1 + grad * (xend - x1)
+        xgap = fpart(x1 + 0.5)
+        xpxl2 = int(xend)
+        ypxl2 = ipart(yend)
+        if steep:
+            self.put_pixel_aa(ypxl2, xpxl2, r, g, b, rfpart(yend) * xgap)
+            self.put_pixel_aa(ypxl2 + 1, xpxl2, r, g, b, fpart(yend) * xgap)
+        else:
+            self.put_pixel_aa(xpxl2, ypxl2, r, g, b, rfpart(yend) * xgap)
+            self.put_pixel_aa(xpxl2, ypxl2 + 1, r, g, b, fpart(yend) * xgap)
+        # 主循环
+        if steep:
+            for x in range(xpxl1 + 1, xpxl2):
+                self.put_pixel_aa(ipart(intery), x, r, g, b, rfpart(intery))
+                self.put_pixel_aa(ipart(intery) + 1, x, r, g, b, fpart(intery))
+                intery += grad
+        else:
+            for x in range(xpxl1 + 1, xpxl2):
+                self.put_pixel_aa(x, ipart(intery), r, g, b, rfpart(intery))
+                self.put_pixel_aa(x, ipart(intery) + 1, r, g, b, fpart(intery))
+                intery += grad
 
     # --- 表达式求值 ---
 
@@ -1351,11 +1552,30 @@ def main():
     if len(sys.argv) < 2:
         print('用法: python vgl.py <file.vgl>')
         sys.exit(1)
-    with open(sys.argv[1], encoding='utf-8') as f:
+    filename = sys.argv[1]
+    with open(filename, encoding='utf-8') as f:
         src = f.read()
-    toks = tokenize(src)
-    ast = Parser(toks).parse_program()
-    Interpreter().run(ast)
+    interp = Interpreter()
+    interp.current_dir = os.path.dirname(os.path.abspath(filename))
+    interp.current_filename = filename
+    interp.current_src = src
+    interp.imported.add(os.path.abspath(filename))
+    try:
+        toks = tokenize(src)
+        ast = Parser(toks).parse_program()
+        interp.run(ast)
+    except (BreakSignal, ContinueSignal, ReturnSignal):
+        # 控制流信号不应泄漏到顶层（解析期已拦截 break/continue 循环外用法）
+        print(f'{filename}: 控制流信号泄漏到顶层（不应发生）', file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        pos = getattr(e, 'vgl_pos', None)
+        if pos is None:
+            pos = interp.current_pos
+        # 用当前文件上下文（可能是 import 的子文件）定位错误
+        print('VGL 错误: ' + format_error(str(e), interp.current_src, pos,
+                                          interp.current_filename), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
