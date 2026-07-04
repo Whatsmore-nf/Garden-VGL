@@ -2,8 +2,10 @@
 """
 VGL 最小解释器 — 单文件，仅依赖标准库
 支持: canvas / bg / let / for / if / fn / return / pixel / stroke / render
-      表达式: + - * /  元组  变量  函数调用  颜色字面量 #rgb
-      内建函数: rand(a,b)  int(x)  abs(x)  floor(x)  sin(x)  cos(x)
+      v0.3: while / break / seed / 比较 < > <= >= == != / 逻辑 and or not / bool
+      表达式: + - * /  元组  变量  函数调用  颜色字面量 #rgb  true/false
+      内建函数: rand(a,b)  int(x)  abs(x)  floor(x)  ceil(x)  sin(x)  cos(x)
+                min(a,b)  max(a,b)  bool(x)
                 line(p1,p2)  circle(cx,cy,r)
 用法: python vgl.py <file.vgl>
 """
@@ -56,7 +58,9 @@ class Token:
 
 
 KEYWORDS = {'canvas', 'bg', 'let', 'for', 'in', 'if', 'else', 'fn', 'return',
-            'pixel', 'stroke', 'render'}
+            'pixel', 'stroke', 'render',
+            # v0.3 新增
+            'while', 'break', 'and', 'or', 'not', 'seed', 'true', 'false'}
 
 
 def tokenize(src):
@@ -139,7 +143,13 @@ def tokenize(src):
             toks.append(Token(simple[c], c, i))
             i += 1
             continue
-        if c in '+-*/=':
+        # 多字符运算符: <= >= == !=
+        if c in '<>=!' and i + 1 < n and src[i + 1] == '=':
+            toks.append(Token('OP', c + '=', i))
+            i += 2
+            continue
+        # 单字符运算符 (注意: '!' 单独非法，仅 '!=' 合法)
+        if c in '+-*/=<>':
             toks.append(Token('OP', c, i))
             i += 1
             continue
@@ -164,6 +174,13 @@ class TupleLit:
     def __init__(self, el): self.elements = el
 class BinOp:
     def __init__(self, op, l, r): self.op, self.left, self.right = op, l, r
+class BoolLit:
+    def __init__(self, v): self.value = v  # Python bool
+class LogicOp:
+    """and / or — 需要短路求值，不预求值右操作数"""
+    def __init__(self, op, l, r): self.op, self.left, self.right = op, l, r
+class UnaryNot:
+    def __init__(self, expr): self.expr = expr
 class Call:
     def __init__(self, name, args, kwargs):
         self.name, self.args, self.kwargs = name, args, kwargs
@@ -173,12 +190,21 @@ class BgStmt:
     def __init__(self, color): self.color = color
 class LetStmt:
     def __init__(self, name, expr): self.name, self.expr = name, expr
+class AssignStmt:
+    """裸赋值: name = expr（name 必须已存在，§3.2.3）"""
+    def __init__(self, name, expr): self.name, self.expr = name, expr
 class ForStmt:
     def __init__(self, var, start, end, body):
         self.var, self.start, self.end, self.body = var, start, end, body
 class IfStmt:
     def __init__(self, cond, then_body, else_body):
         self.cond, self.then_body, self.else_body = cond, then_body, else_body
+class WhileStmt:
+    def __init__(self, cond, body): self.cond, self.body = cond, body
+class BreakStmt:
+    pass
+class SeedStmt:
+    def __init__(self, n): self.n = n
 class FnDef:
     def __init__(self, name, params, body):
         self.name, self.params, self.body = name, params, body
@@ -202,6 +228,7 @@ class Parser:
     def __init__(self, tokens):
         self.toks = tokens
         self.pos = 0
+        self.loop_depth = 0  # 用于校验 break 必须在循环体内
 
     def peek(self, off=0):
         return self.toks[self.pos + off]
@@ -232,10 +259,22 @@ class Parser:
                 'if': self.parse_if, 'fn': self.parse_fn,
                 'return': self.parse_return, 'pixel': self.parse_pixel,
                 'stroke': self.parse_stroke, 'render': self.parse_render,
+                # v0.3 新增
+                'while': self.parse_while, 'break': self.parse_break,
+                'seed': self.parse_seed,
             }
             if t.value in dispatch:
                 return dispatch[t.value]()
+        # 裸赋值语句: IDENT '=' Expr  （需与 ExprStmt 区分：看 IDENT 后是否紧跟 '='）
+        # 注意: '==' 是比较运算符，已在词法层合并为单个 OP token，不会误判
+        if t.type == 'IDENT' and self.peek(1).type == 'OP' and self.peek(1).value == '=':
+            return self.parse_assign()
         return ExprStmt(self.parse_expr())
+
+    def parse_assign(self):
+        name = self.expect('IDENT').value
+        self.expect('OP', '=')
+        return AssignStmt(name, self.parse_expr())
 
     def parse_canvas(self):
         self.expect('KEYWORD', 'canvas')
@@ -275,11 +314,38 @@ class Parser:
         self.expect('DOTDOT')
         end = self.parse_expr()
         self.expect('LBRACE')
+        self.loop_depth += 1
         body = []
         while self.peek().type != 'RBRACE':
             body.append(self.parse_stmt())
         self.expect('RBRACE')
+        self.loop_depth -= 1
         return ForStmt(var, start, end, body)
+
+    def parse_while(self):
+        self.expect('KEYWORD', 'while')
+        cond = self.parse_expr()
+        self.expect('LBRACE')
+        self.loop_depth += 1
+        body = []
+        while self.peek().type != 'RBRACE':
+            body.append(self.parse_stmt())
+        self.expect('RBRACE')
+        self.loop_depth -= 1
+        return WhileStmt(cond, body)
+
+    def parse_break(self):
+        self.expect('KEYWORD', 'break')
+        if self.loop_depth == 0:
+            raise SyntaxError('break 只能出现在 for / while 循环体内')
+        return BreakStmt()
+
+    def parse_seed(self):
+        self.expect('KEYWORD', 'seed')
+        n = self.expect('NUMBER').value
+        if not isinstance(n, int):
+            raise SyntaxError(f'seed 要求整数参数, 得到 {n!r}')
+        return SeedStmt(n)
 
     def parse_if(self):
         self.expect('KEYWORD', 'if')
@@ -350,9 +416,35 @@ class Parser:
                 self.advance()
         return fields
 
-    # 表达式: 加减 → 乘除 → 主表达式
+    # 表达式优先级链（低 → 高）:
+    #   parse_or (2) → parse_and (3) → parse_compare (4) → parse_add (5)
+    #   → parse_mul (6) → parse_unary (7) → parse_primary (8)
+    # 对应 v0.3 规范 §3.3.1 优先级表
     def parse_expr(self):
-        return self.parse_add()
+        return self.parse_or()
+
+    def parse_or(self):
+        left = self.parse_and()
+        while self.peek().type == 'KEYWORD' and self.peek().value == 'or':
+            self.advance()
+            left = LogicOp('or', left, self.parse_and())
+        return left
+
+    def parse_and(self):
+        left = self.parse_compare()
+        while self.peek().type == 'KEYWORD' and self.peek().value == 'and':
+            self.advance()
+            left = LogicOp('and', left, self.parse_compare())
+        return left
+
+    def parse_compare(self):
+        left = self.parse_add()
+        # 比较运算符无结合性: 仅允许单个比较（a < b < c 非法）
+        if self.peek().type == 'OP' and self.peek().value in ('<', '>', '<=', '>=', '==', '!='):
+            op = self.advance().value
+            right = self.parse_add()
+            return BinOp(op, left, right)
+        return left
 
     def parse_add(self):
         left = self.parse_mul()
@@ -372,6 +464,9 @@ class Parser:
         if self.peek().type == 'OP' and self.peek().value == '-':
             self.advance()
             return BinOp('-', Num(0), self.parse_unary())
+        if self.peek().type == 'KEYWORD' and self.peek().value == 'not':
+            self.advance()
+            return UnaryNot(self.parse_unary())
         return self.parse_primary()
 
     def parse_primary(self):
@@ -385,6 +480,9 @@ class Parser:
         if t.type == 'COLOR':
             self.advance()
             return ColorLit(t.value[0], t.value[1], t.value[2])
+        if t.type == 'KEYWORD' and t.value in ('true', 'false'):
+            self.advance()
+            return BoolLit(t.value == 'true')
         if t.type == 'LPAREN':
             self.advance()
             first = self.parse_expr()
@@ -426,6 +524,20 @@ class ReturnSignal(Exception):
     def __init__(self, val): self.value = val
 
 
+class BreakSignal(Exception):
+    """break 语句的信号，由 for/while 循环体捕获"""
+    pass
+
+
+def _bool_fn(x):
+    """bool(x) 内建: 0/0.0/false → False, 否则 True (§6.1, §4.2)"""
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return x != 0
+    return bool(x)
+
+
 class Interpreter:
     def __init__(self):
         self.cw = 0
@@ -443,6 +555,7 @@ class Interpreter:
             'cos': math.cos,
             'min': min,
             'max': max,
+            'bool': _bool_fn,  # v0.3
             'line': lambda p1, p2: ('line', p1, p2),
             'circle': lambda cx, cy, r: ('circle', cx, cy, r),
         }
@@ -450,6 +563,17 @@ class Interpreter:
     def run(self, ast):
         for stmt in ast:
             self.exec(stmt, self.globals)
+
+    @staticmethod
+    def truthy(v):
+        """条件求值: number 非零为真, bool 直接, None 为假 (§3.2.9, §4.2)"""
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return v != 0
+        if v is None:
+            return False
+        return bool(v)
 
     # --- 语句执行 ---
 
@@ -463,17 +587,40 @@ class Interpreter:
                 self.buf[i] = r; self.buf[i + 1] = g; self.buf[i + 2] = b
         elif isinstance(stmt, LetStmt):
             env[stmt.name] = self.eval(stmt.expr, env)
+        elif isinstance(stmt, AssignStmt):
+            # 裸赋值（§3.2.3）：仅修改已存在绑定，不创建新绑定
+            # 当前实现为单 env 模型（无作用域链），先查 env 再查 globals
+            if stmt.name in env:
+                env[stmt.name] = self.eval(stmt.expr, env)
+            elif stmt.name in self.globals:
+                self.globals[stmt.name] = self.eval(stmt.expr, env)
+            else:
+                raise NameError(f'赋值给未声明变量: {stmt.name}（应使用 let 声明）')
         elif isinstance(stmt, ForStmt):
             start = self.eval(stmt.start, env)
             end = self.eval(stmt.end, env)
             i = start
             while i < end:
                 env[stmt.var] = i
-                for s in stmt.body:
-                    self.exec(s, env)
+                try:
+                    for s in stmt.body:
+                        self.exec(s, env)
+                except BreakSignal:
+                    break
                 i += 1
+        elif isinstance(stmt, WhileStmt):
+            while self.truthy(self.eval(stmt.cond, env)):
+                try:
+                    for s in stmt.body:
+                        self.exec(s, env)
+                except BreakSignal:
+                    break
+        elif isinstance(stmt, BreakStmt):
+            raise BreakSignal()
+        elif isinstance(stmt, SeedStmt):
+            random.seed(stmt.n)
         elif isinstance(stmt, IfStmt):
-            if self.eval(stmt.cond, env):
+            if self.truthy(self.eval(stmt.cond, env)):
                 for s in stmt.then_body:
                     self.exec(s, env)
             elif stmt.else_body:
@@ -572,6 +719,28 @@ class Interpreter:
             if expr.op == '-': return l - r
             if expr.op == '*': return l * r
             if expr.op == '/': return l / r
+            # v0.3 比较运算符（返回 bool）
+            if expr.op == '<': return l < r
+            if expr.op == '>': return l > r
+            if expr.op == '<=': return l <= r
+            if expr.op == '>=': return l >= r
+            if expr.op == '==': return l == r
+            if expr.op == '!=': return l != r
+        if isinstance(expr, BoolLit):
+            return expr.value
+        if isinstance(expr, LogicOp):
+            # v0.3 短路求值：左操作数先求值，按需求值右操作数
+            l = self.eval(expr.left, env)
+            if expr.op == 'and':
+                if not self.truthy(l):
+                    return False
+                return bool(self.truthy(self.eval(expr.right, env)))
+            if expr.op == 'or':
+                if self.truthy(l):
+                    return True
+                return bool(self.truthy(self.eval(expr.right, env)))
+        if isinstance(expr, UnaryNot):
+            return not self.truthy(self.eval(expr.expr, env))
         if isinstance(expr, Call):
             name = expr.name
             arg_vals = [self.eval(a, env) for a in expr.args]
