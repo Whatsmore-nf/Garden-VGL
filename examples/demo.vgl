@@ -1,0 +1,58 @@
+// demo.vgl — VGL 最小实现演示：星空 + 月亮 + 草地
+
+canvas 400x300
+bg #0a0a1a
+
+// ---- 星空 ----
+for i in 0..600 {
+    let x = int(rand(0, 400))
+    let y = int(rand(0, 200))
+    let b = int(rand(120, 255))
+    pixel(x: x, y: y, rgb: (b, b, b))
+}
+
+// ---- 月亮（圆环 + 内部填色）----
+stroke {
+    path: circle(320, 70, 35),
+    width: 3,
+    color: #ffd966
+}
+for i in 0..40 {
+    let a = rand(0, 6.28)
+    let r = rand(0, 30)
+    let px = int(320 + r * cos(a))
+    let py = int(70 + r * sin(a))
+    pixel(x: px, y: py, rgb: (255, 230, 150))
+}
+
+// ---- 地平线 ----
+for i in 0..400 {
+    pixel(x: i, y: 220, rgb: (40, 50, 70))
+}
+
+// ---- 草地 ----
+for i in 0..400 {
+    let h = int(rand(5, 25))
+    let x = i
+    let y = 220
+    let gx = int(rand(-3, 3))
+    let gy = 220 - h
+    let shade = int(rand(30, 80))
+    stroke {
+        path: line((x, y), (x + gx, gy)),
+        width: 1,
+        color: (20, shade, 20)
+    }
+}
+
+// ---- 萤火虫 ----
+for i in 0..30 {
+    let x = int(rand(0, 400))
+    let y = int(rand(100, 210))
+    pixel(x: x, y: y, rgb: (255, 255, 100))
+    pixel(x: x + 1, y: y, rgb: (200, 200, 50))
+    pixel(x: x, y: y + 1, rgb: (200, 200, 50))
+    pixel(x: x + 1, y: y + 1, rgb: (150, 150, 30))
+}
+
+render "output/demo_output.png"

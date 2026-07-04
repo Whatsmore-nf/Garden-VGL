@@ -1,0 +1,18 @@
+// rings.vgl — 同心圆条纹（验证 v0.2.1 示例 4 合法性）
+canvas 256x256
+bg #ffffff
+
+for y in 0..256 {
+    for x in 0..256 {
+        let dx = x - 128
+        let dy = y - 128
+        let d = int(dx * dx + dy * dy)
+        let band = int(d / 400)
+        let toggle = band - int(band / 2) * 2
+        if toggle {
+            pixel(x: x, y: y, rgb: #336699)
+        }
+    }
+}
+
+render "output/rings.png"
