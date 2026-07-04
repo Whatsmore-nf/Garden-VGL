@@ -12,6 +12,12 @@ VGL 最小解释器 — 单文件，仅依赖标准库
             array 数组（字面量/索引/可变/push/pop/len）
             dict 字典（dict() 构造/索引/可变/keys/values/has）
             索引赋值 arr[i] = v / d[k] = v / obj.field = v
+            import 模块导入 / 错误定位（filename:line:col）
+            stroke 反走样（Wu 细线 + Bresenham+笔刷粗线 + 中点圆）
+      v0.5 批次 C: material 材质（定义/stroke material 字段 + noise 扰动）
+            layer 图层（离屏缓冲区 + compose 合成 over/add/mul/screen）
+            field 颜色场（(x,y)→color 函数 + fill 遍历填充）
+            perlin / worley / fbm 噪声函数
       表达式: + - * /  元组  变量  函数调用  颜色字面量 #rgb  true/false  tuple[i]
               array[i]  dict[k]  obj.field
       内建函数: rand(a,b)  int(x)  abs(x)  floor(x)  ceil(x)  sin(x)  cos(x)
@@ -21,6 +27,8 @@ VGL 最小解释器 — 单文件，仅依赖标准库
                 dot(a,b)  length(p1,p2)
                 len(x)  push(arr,v)  pop(arr)  array(...)  dict(...)
                 keys(d)  values(d)  has(d,k)
+                perlin(x,y)  worley(x,y)  fbm(x,y,octaves)
+                compose(name,blend)  fill(name)
 用法: python vgl.py <file.vgl>
 """
 
@@ -80,7 +88,9 @@ KEYWORDS = {'canvas', 'bg', 'let', 'for', 'in', 'if', 'else', 'fn', 'return',
             # v0.5 新增
             'struct',
             # v0.5 批次 B 新增
-            'import'}
+            'import',
+            # v0.5 批次 C 新增
+            'material', 'layer', 'field'}
 
 
 # ============================================================
@@ -322,6 +332,20 @@ class RenderStmt:
 class ImportStmt:
     """v0.5 import "path" 模块导入（§3.2.14）。path 为相对当前文件的 .vgl 路径。"""
     def __init__(self, path): self.path = path
+class MaterialDef:
+    """v0.5 批次 C 材质定义（§4.8）。
+    fields: dict {field_name: expr}，常用字段 color/alpha/blend/noise。"""
+    def __init__(self, name, fields):
+        self.name, self.fields = name, fields
+class LayerDef:
+    """v0.5 批次 C 图层定义（§7.4）。name + body（在离屏缓冲区执行的语句列表）。"""
+    def __init__(self, name, body):
+        self.name, self.body = name, body
+class FieldDef:
+    """v0.5 批次 C 颜色场定义（§7.5）。name + params（应含 x,y） + body。
+    语义上为 (x, y) → color 的纯函数，注册为 Closure。"""
+    def __init__(self, name, params, body):
+        self.name, self.params, self.body = name, params, body
 class ExprStmt:
     def __init__(self, expr): self.expr = expr
 
@@ -394,6 +418,10 @@ class Parser:
                 'struct': self.parse_struct,
                 # v0.5 批次 B 新增
                 'import': self.parse_import,
+                # v0.5 批次 C 新增
+                'material': self.parse_material,
+                'layer': self.parse_layer,
+                'field': self.parse_field,
             }
             if t.value in dispatch:
                 return dispatch[t.value]()
@@ -597,11 +625,58 @@ class Parser:
         path_tok = self.expect('STRING')
         return ImportStmt(path_tok.value)
 
+    def parse_material(self):
+        """v0.5 批次 C: material Name { field: expr, ... }（§4.8）"""
+        self.expect('KEYWORD', 'material')
+        name = self.expect('IDENT').value
+        self.expect('LBRACE')
+        fields = self.parse_kwargs()
+        self.expect('RBRACE')
+        return MaterialDef(name, fields)
+
+    def parse_layer(self):
+        """v0.5 批次 C: layer Name { ... } 图层定义（§7.4）
+        body 在离屏缓冲区执行，结束后用 compose() 合成到主画布。"""
+        self.expect('KEYWORD', 'layer')
+        name = self.expect('IDENT').value
+        self.expect('LBRACE')
+        body = []
+        while self.peek().type != 'RBRACE':
+            body.append(self.parse_stmt())
+        self.expect('RBRACE')
+        return LayerDef(name, body)
+
+    def parse_field(self):
+        """v0.5 批次 C: field Name(x, y) { ... return color } 颜色场（§7.5）
+        语义等同 fn，但注册为 FieldClosure，配合 fill() 遍历画布。"""
+        self.expect('KEYWORD', 'field')
+        name = self.expect('IDENT').value
+        self.expect('LPAREN')
+        params = []
+        if self.peek().type != 'RPAREN':
+            params.append(self.expect('IDENT').value)
+            while self.peek().type == 'COMMA':
+                self.advance()
+                params.append(self.expect('IDENT').value)
+        self.expect('RPAREN')
+        self.expect('LBRACE')
+        body = []
+        while self.peek().type != 'RBRACE':
+            body.append(self.parse_stmt())
+        self.expect('RBRACE')
+        return FieldDef(name, params, body)
+
     def parse_kwargs(self):
-        """解析 key: val, key: val, ... 形式"""
+        """解析 key: val, key: val, ... 形式
+        v0.5 批次 C：允许 KEYWORD 作为 key（如 stroke { material: ... }，
+        pixel/parse_material 等场景，关键字作为字段名不应被拒绝）"""
         fields = {}
         while self.peek().type != 'RPAREN' and self.peek().type != 'RBRACE':
-            key = self.expect('IDENT').value
+            t = self.peek()
+            if t.type in ('IDENT', 'KEYWORD'):
+                key = self.advance().value
+            else:
+                raise vgl_error(SyntaxError, f'期望字段名(IDENT/KEYWORD), 得到 {t.type}', t.pos)
             self.expect('COLON')
             fields[key] = self.parse_expr()
             if self.peek().type == 'COMMA':
@@ -812,6 +887,33 @@ class StructInstance:
         return f'<{self.struct_name} {items}>'
 
 
+class MaterialInstance:
+    """材质实例（v0.5 批次 C §4.8）。fields 为 dict。
+    常用字段: color / alpha / blend / noise / gradient。"""
+    __slots__ = ('name', 'fields')
+
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields  # dict
+
+    def __repr__(self):
+        return f'<material {self.name}>'
+
+
+class LayerInstance:
+    """图层对象（v0.5 批次 C §7.4）。存储离屏缓冲区。"""
+    __slots__ = ('name', 'width', 'height', 'buf')
+
+    def __init__(self, name, width, height, buf):
+        self.name = name
+        self.width = width
+        self.height = height
+        self.buf = buf  # bytearray, 每像素 3 字节 RGB
+
+    def __repr__(self):
+        return f'<layer {self.name} {self.width}x{self.height}>'
+
+
 def _bool_fn(x):
     """bool(x) 内建: 0/0.0/false → False, 否则 True (§6.1, §4.2)"""
     if isinstance(x, bool):
@@ -936,6 +1038,98 @@ def _path(points):
     return ('polyline', points)
 
 
+# ============================================================
+# v0.5 批次 C 噪声函数（§6.3 perlin / worley / fbm）
+# ============================================================
+
+# Perlin 置换表：基于固定种子的 256 排列表，避免每次调用随机
+_PERLIN_PERM = list(range(256))
+random.Random(20250705).shuffle(_PERLIN_PERM)
+_PERLIN_PERM = _PERLIN_PERM + _PERLIN_PERM  # 扩展到 512 以省去 & 255
+
+
+def _perlin_grad2(hash_val, x, y):
+    """2D 梯度向量：根据 hash 选择 (x,y), (-x,y), (x,-y), (-x,-y), (y,x), ..."""
+    h = hash_val & 7
+    u = x if h < 4 else y
+    v = y if h < 4 else x
+    return (u if (h & 1) == 0 else -u) + (v if (h & 2) == 0 else -v)
+
+
+def _perlin_fade(t):
+    """缓和曲线 fade(t) = 6t^5 - 15t^4 + 10t^3（C1 连续导数）"""
+    return t * t * t * (t * (t * 6 - 15) + 10)
+
+
+def perlin(x, y):
+    """2D Perlin 噪声（§6.3）。返回 [-1, 1] 区间浮点数。"""
+    xi = int(math.floor(x)) & 255
+    yi = int(math.floor(y)) & 255
+    xf = x - math.floor(x)
+    yf = y - math.floor(y)
+    u = _perlin_fade(xf)
+    v = _perlin_fade(yf)
+    p = _PERLIN_PERM
+    aa = p[p[xi] + yi]
+    ab = p[p[xi] + yi + 1]
+    ba = p[p[xi + 1] + yi]
+    bb = p[p[xi + 1] + yi + 1]
+    x1 = _lerp_scalar(_perlin_grad2(aa, xf, yf),
+                      _perlin_grad2(ba, xf - 1, yf), u)
+    x2 = _lerp_scalar(_perlin_grad2(ab, xf, yf - 1),
+                      _perlin_grad2(bb, xf - 1, yf - 1), u)
+    return _lerp_scalar(x1, x2, v)
+
+
+def _lerp_scalar(a, b, t):
+    return a + t * (b - a)
+
+
+def worley(x, y):
+    """2D Worley 噪声（cellular noise，§6.3）。
+    返回最近特征点的欧氏距离（[0, ~cell_size] 区间）。"""
+    cell_size = 32
+    cx = int(math.floor(x / cell_size))
+    cy = int(math.floor(y / cell_size))
+    min_dist = float('inf')
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            ncx = cx + dx
+            ncy = cy + dy
+            # 用 hash 在每个 cell 内确定一个固定特征点
+            h = (ncx * 374761393 + ncy * 668265263) & 0xffffffff
+            h = ((h ^ (h >> 13)) * 1274126177) & 0xffffffff
+            h = (h ^ (h >> 16)) & 0xffffffff
+            px = ncx * cell_size + (h % cell_size)
+            py = ncy * cell_size + ((h >> 8) % cell_size)
+            d = math.sqrt((x - px) ** 2 + (y - py) ** 2)
+            if d < min_dist:
+                min_dist = d
+    return min_dist
+
+
+def fbm(x, y, octaves=4):
+    """分形布朗运动（Fractal Brownian Motion，§6.3）。
+    多倍频 Perlin 叠加，振幅减半频率倍增。返回 [-1, 1] 区间。"""
+    if not isinstance(octaves, (int, float)) or isinstance(octaves, bool):
+        raise TypeError(f'fbm octaves 要求 number, 得到 {type(octaves).__name__}')
+    octaves = int(octaves)
+    if octaves < 1:
+        octaves = 1
+    if octaves > 8:
+        octaves = 8
+    total = 0.0
+    amp = 1.0
+    freq = 1.0
+    norm = 0.0
+    for _ in range(octaves):
+        total += perlin(x * freq, y * freq) * amp
+        norm += amp
+        amp *= 0.5
+        freq *= 2.0
+    return total / norm if norm > 0 else 0.0
+
+
 class Interpreter:
     def __init__(self):
         self.cw = 0
@@ -947,6 +1141,10 @@ class Interpreter:
         self.funcs = {}
         # v0.5 struct 类型注册表：name -> StructDefn
         self.structs = {}
+        # v0.5 批次 C 材质注册表：name -> MaterialInstance
+        self.materials = {}
+        # v0.5 批次 C 图层注册表：name -> LayerInstance（含离屏缓冲区）
+        self.layers = {}
         # v0.5 §8.2 错误定位：当前执行语句的字符偏移
         self.current_pos = None
         # v0.5 批次 B 模块导入（§3.2.14）
@@ -984,6 +1182,13 @@ class Interpreter:
             'keys': _keys_fn,      # dict 键数组
             'values': _values_fn,  # dict 值数组
             'has': _has_fn,        # dict 是否含键
+            # v0.5 批次 C 噪声（§6.3）
+            'perlin': perlin,      # 2D Perlin，[-1,1]
+            'worley': worley,      # 2D Worley，最近特征点距离
+            'fbm': fbm,            # 分形布朗运动，[-1,1]
+            # v0.5 批次 C 图层/颜色场（§7.4, §7.5）
+            'compose': self.compose_layer,  # compose(name, blend) 图层合成
+            'fill': self.fill_field,        # fill(name) 颜色场填充画布
         }
 
     def run(self, ast):
@@ -1059,10 +1264,12 @@ class Interpreter:
         if isinstance(stmt, CanvasStmt):
             self.cw, self.ch = stmt.width, stmt.height
             self.buf = bytearray(self.cw * self.ch * 3)
+            self._bg_color = (0, 0, 0)  # v0.5 批次 C：图层离屏缓冲区初始化用
         elif isinstance(stmt, BgStmt):
             r, g, b = self.eval(stmt.color, env)
             for i in range(0, len(self.buf), 3):
                 self.buf[i] = r; self.buf[i + 1] = g; self.buf[i + 2] = b
+            self._bg_color = (r, g, b)  # v0.5 批次 C：记录背景色供图层用
         elif isinstance(stmt, LetStmt):
             env.vars[stmt.name] = self.eval(stmt.expr, env)
         elif isinstance(stmt, AssignStmt):
@@ -1168,6 +1375,21 @@ class Interpreter:
         elif isinstance(stmt, ImportStmt):
             # v0.5 批次 B §3.2.14 模块导入
             self._do_import(stmt.path)
+        elif isinstance(stmt, MaterialDef):
+            # v0.5 批次 C §4.8 材质定义：求值字段并注册到 self.materials + env
+            fields = {k: self.eval(v, env) for k, v in stmt.fields.items()}
+            mat = MaterialInstance(stmt.name, fields)
+            self.materials[stmt.name] = mat
+            env.vars[stmt.name] = mat  # 允许 material: myMat 通过 VarRef 解析
+        elif isinstance(stmt, LayerDef):
+            # v0.5 批次 C §7.4 图层定义：在离屏缓冲区执行 body，
+            # 完成后存入 self.layers，等待 compose() 合成到主画布
+            self._exec_layer(stmt, env)
+        elif isinstance(stmt, FieldDef):
+            # v0.5 批次 C §7.5 颜色场定义：注册为 Closure（与 fn 等价）
+            closure = Closure(stmt.name, stmt.params, stmt.body, env)
+            env.vars[stmt.name] = closure
+            self.funcs[stmt.name] = (stmt.params, stmt.body, env)
         elif isinstance(stmt, ExprStmt):
             self.eval(stmt.expr, env)
 
@@ -1205,6 +1427,81 @@ class Interpreter:
         self.current_src = old_src
         self.current_pos = old_pos
 
+    def _exec_layer(self, stmt, env):
+        """v0.5 批次 C §7.4 图层执行：分配离屏缓冲区，切换 cw/ch/buf 后
+        执行 body，结束后恢复主画布缓冲区并存入 self.layers。"""
+        layer_w = self.cw
+        layer_h = self.ch
+        layer_buf = bytearray(len(self.buf)) if self.buf else bytearray(layer_w * layer_h * 3)
+        # 初始化为背景色（若未设 bg 则黑色）
+        for i in range(0, len(layer_buf), 3):
+            layer_buf[i] = self._bg_color[0] if hasattr(self, '_bg_color') else 0
+            layer_buf[i + 1] = self._bg_color[1] if hasattr(self, '_bg_color') else 0
+            layer_buf[i + 2] = self._bg_color[2] if hasattr(self, '_bg_color') else 0
+        # 切换缓冲区
+        old_cw, old_ch, old_buf = self.cw, self.ch, self.buf
+        self.cw, self.ch, self.buf = layer_w, layer_h, layer_buf
+        # 块作用域
+        block_env = Environment(parent=env)
+        for s in stmt.body:
+            self.exec(s, block_env)
+        # 恢复主画布
+        self.cw, self.ch, self.buf = old_cw, old_ch, old_buf
+        self.layers[stmt.name] = LayerInstance(stmt.name, layer_w, layer_h, layer_buf)
+
+    def compose_layer(self, name, blend='over'):
+        """v0.5 批次 C §7.4 compose(name, blend) 图层合成。
+        blend 模式：'over'（默认，alpha 混合）/ 'add'（加法）/ 'mul'（乘法）/
+        'screen'（滤色）。alpha 由图层像素与主画布像素的亮度差近似。"""
+        if name not in self.layers:
+            raise NameError(f'未定义图层: {name}')
+        layer = self.layers[name]
+        if layer.width != self.cw or layer.height != self.ch:
+            raise ValueError(f'图层尺寸 {layer.width}x{layer.height} 与画布 {self.cw}x{self.ch} 不匹配')
+        lb = layer.buf
+        mb = self.buf
+        for i in range(0, len(lb), 3):
+            lr, lg, lb_ = lb[i], lb[i + 1], lb[i + 2]
+            mr, mg, mb_ = mb[i], mb[i + 1], mb[i + 2]
+            if blend == 'add':
+                mb[i] = min(255, mr + lr) & 0xff
+                mb[i + 1] = min(255, mg + lg) & 0xff
+                mb[i + 2] = min(255, mb_ + lb_) & 0xff
+            elif blend == 'mul':
+                mb[i] = (mr * lr // 255) & 0xff
+                mb[i + 1] = (mg * lg // 255) & 0xff
+                mb[i + 2] = (mb_ * lb_ // 255) & 0xff
+            elif blend == 'screen':
+                mb[i] = (255 - ((255 - mr) * (255 - lr) // 255)) & 0xff
+                mb[i + 1] = (255 - ((255 - mg) * (255 - lg) // 255)) & 0xff
+                mb[i + 2] = (255 - ((255 - mb_) * (255 - lb_) // 255)) & 0xff
+            else:  # 'over' — 简单覆盖（图层非透明像素覆盖主画布）
+                # 用图层像素亮度作为 alpha 近似（更亮的像素更不透明）
+                alpha = (lr + lg + lb_) / (3 * 255)
+                mb[i] = int(mr * (1 - alpha) + lr * alpha) & 0xff
+                mb[i + 1] = int(mg * (1 - alpha) + lg * alpha) & 0xff
+                mb[i + 2] = int(mb_ * (1 - alpha) + lb_ * alpha) & 0xff
+
+    def fill_field(self, name):
+        """v0.5 批次 C §7.5 fill(name) 颜色场填充：对画布每个像素 (x, y)
+        调用 field 函数，用返回的 color 写入。"""
+        # 优先从 env 查 Closure（field 定义时已注册）
+        target_env = self.globals.find_env(name)
+        if target_env is not None and isinstance(target_env.vars[name], Closure):
+            closure = target_env.vars[name]
+        elif name in self.funcs:
+            params, body, def_env = self.funcs[name]
+            closure = Closure(name, params, body, def_env)
+        else:
+            raise NameError(f'未定义颜色场: {name}')
+        for y in range(self.ch):
+            for x in range(self.cw):
+                color = self._invoke_closure(closure, [x, y], {})
+                if isinstance(color, tuple) and len(color) >= 3:
+                    self.put_pixel(x, y, (int(color[0]) & 0xff,
+                                          int(color[1]) & 0xff,
+                                          int(color[2]) & 0xff))
+
     def put_pixel(self, x, y, rgb):
         if 0 <= x < self.cw and 0 <= y < self.ch:
             idx = (y * self.cw + x) * 3
@@ -1229,7 +1526,19 @@ class Interpreter:
         f = {k: self.eval(v, block_env) for k, v in stmt.fields.items()}
         path = f.get('path')
         width = int(f.get('width', 1))
-        color = f.get('color', (0, 0, 0))
+        # v0.5 批次 C：material 字段优先（覆盖 color），支持 noise 扰动
+        mat = f.get('material')
+        if isinstance(mat, MaterialInstance):
+            color = mat.fields.get('color', (0, 0, 0))
+            noise = mat.fields.get('noise', 0.0)
+            if noise:
+                # 沿路径长度方向叠加 Perlin 扰动（影响亮度，非位移）
+                n = perlin(f.get('width', 1.0) * 10, 0.0) * float(noise)
+                color = (max(0, min(255, int(color[0] + n * 255))),
+                         max(0, min(255, int(color[1] + n * 255))),
+                         max(0, min(255, int(color[2] + n * 255))))
+        else:
+            color = f.get('color', (0, 0, 0))
         if not isinstance(color, tuple):
             color = (0, 0, 0)
         r, g, b = color[0], color[1], color[2]
