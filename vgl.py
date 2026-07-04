@@ -7,12 +7,20 @@ VGL 最小解释器 — 单文件，仅依赖标准库
             pow / sqrt / 闭包（可变捕获）
       v0.4: 块作用域（for/if/while/stroke 子 Environment）
             continue / 带标签 break（label: for ... break label）
+      v0.5: 字符串转义 \n \t \\ \" \r \0
+            struct 类型（定义/构造/字段访问/赋值）
+            array 数组（字面量/索引/可变/push/pop/len）
+            dict 字典（dict() 构造/索引/可变/keys/values/has）
+            索引赋值 arr[i] = v / d[k] = v / obj.field = v
       表达式: + - * /  元组  变量  函数调用  颜色字面量 #rgb  true/false  tuple[i]
+              array[i]  dict[k]  obj.field
       内建函数: rand(a,b)  int(x)  abs(x)  floor(x)  ceil(x)  sin(x)  cos(x)
                 min(a,b)  max(a,b)  bool(x)  pow(a,b)  sqrt(x)
                 line(p1,p2)  circle(cx,cy,r)
                 bezier(p1,p2,p3,p4)  qbezier(p1,p2,p3)  path(pts)
                 dot(a,b)  length(p1,p2)
+                len(x)  push(arr,v)  pop(arr)  array(...)  dict(...)
+                keys(d)  values(d)  has(d,k)
 用法: python vgl.py <file.vgl>
 """
 
@@ -68,7 +76,9 @@ KEYWORDS = {'canvas', 'bg', 'let', 'for', 'in', 'if', 'else', 'fn', 'return',
             # v0.3 新增
             'while', 'break', 'and', 'or', 'not', 'seed', 'true', 'false',
             # v0.4 新增
-            'continue'}
+            'continue',
+            # v0.5 新增
+            'struct'}
 
 
 def tokenize(src):
@@ -108,12 +118,29 @@ def tokenize(src):
                 raise SyntaxError(f'非法颜色 #{h} 于位置 {i}')
             i = j
             continue
-        # 字符串
+        # 字符串（v0.5 支持 \n \t \\ \" \r \0 转义，§2.4.4）
         if c == '"':
             j = i + 1
+            chars = []
+            special = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\',
+                       '"': '"', '0': '\0'}
             while j < n and src[j] != '"':
-                j += 1
-            toks.append(Token('STRING', src[i + 1:j], i))
+                if src[j] == '\\' and j + 1 < n:
+                    nxt = src[j + 1]
+                    if nxt in special:
+                        chars.append(special[nxt])
+                        j += 2
+                    else:
+                        # 未知转义保留原样（含反斜杠）
+                        chars.append('\\')
+                        chars.append(nxt)
+                        j += 2
+                else:
+                    chars.append(src[j])
+                    j += 1
+            if j >= n:
+                raise SyntaxError(f'未终止的字符串于位置 {i}')
+            toks.append(Token('STRING', ''.join(chars), i))
             i = j + 1
             continue
         # 数字（注意不吞掉 .. 范围运算符）
@@ -134,6 +161,11 @@ def tokenize(src):
         if c == '.' and i + 1 < n and src[i + 1] == '.':
             toks.append(Token('DOTDOT', '..', i))
             i += 2
+            continue
+        # v0.5 字段访问 .（单点，区别于 .. 范围）
+        if c == '.':
+            toks.append(Token('DOT', '.', i))
+            i += 1
             continue
         # 标识符 / 关键字
         if c.isalpha() or c == '_':
@@ -191,8 +223,27 @@ class LogicOp:
 class UnaryNot:
     def __init__(self, expr): self.expr = expr
 class IndexExpr:
-    """tuple[i] 索引表达式（§3.3.4）"""
+    """tuple[i] / array[i] / dict[k] 索引表达式（§3.3.4，v0.5 扩展）"""
     def __init__(self, base, index): self.base, self.index = base, index
+class IndexAssign:
+    """arr[i] = v / d[k] = v 索引赋值（v0.5 新增）"""
+    def __init__(self, base, index, expr):
+        self.base, self.index, self.expr = base, index, expr
+class ArrayLit:
+    """[1, 2, 3] 数组字面量（v0.5 新增）"""
+    def __init__(self, el): self.elements = el
+class FieldAccess:
+    """obj.field 字段访问（v0.5 struct）"""
+    def __init__(self, obj, name): self.obj, self.name = obj, name
+class FieldAssign:
+    """obj.field = expr 字段赋值（v0.5 struct）"""
+    def __init__(self, obj, name, expr):
+        self.obj, self.name, self.expr = obj, name, expr
+class StructDef:
+    """struct 类型定义（v0.5 新增）
+    fields: [(name, default_expr), ...]"""
+    def __init__(self, name, fields):
+        self.name, self.fields = name, fields
 class Call:
     def __init__(self, name, args, kwargs):
         self.name, self.args, self.kwargs = name, args, kwargs
@@ -290,6 +341,8 @@ class Parser:
                 'seed': self.parse_seed,
                 # v0.4 新增
                 'continue': self.parse_continue,
+                # v0.5 新增
+                'struct': self.parse_struct,
             }
             if t.value in dispatch:
                 return dispatch[t.value]()
@@ -297,6 +350,14 @@ class Parser:
         # 注意: '==' 是比较运算符，已在词法层合并为单个 OP token，不会误判
         if t.type == 'IDENT' and self.peek(1).type == 'OP' and self.peek(1).value == '=':
             return self.parse_assign()
+        # v0.5 字段赋值: IDENT '.' IDENT '=' Expr  → obj.field = v
+        if t.type == 'IDENT' and self.peek(1).type == 'DOT' \
+                and self.peek(2).type == 'IDENT' \
+                and self.peek(3).type == 'OP' and self.peek(3).value == '=':
+            return self.parse_field_assign()
+        # v0.5 索引赋值: IDENT '[' ... ']' '=' Expr  → arr[i] = v / d[k] = v
+        if t.type == 'IDENT' and self.peek(1).type == 'LBRACKET':
+            return self.parse_index_assign()
         return ExprStmt(self.parse_expr())
 
     def parse_assign(self):
@@ -333,6 +394,42 @@ class Parser:
         name = self.expect('IDENT').value
         self.expect('OP', '=')
         return LetStmt(name, self.parse_expr())
+
+    def parse_struct(self):
+        """v0.5 struct 定义: struct Name { field: default, field: default, ... }"""
+        self.expect('KEYWORD', 'struct')
+        name = self.expect('IDENT').value
+        self.expect('LBRACE')
+        fields = []  # [(field_name, default_expr), ...]
+        while self.peek().type != 'RBRACE':
+            fname = self.expect('IDENT').value
+            self.expect('COLON')
+            default = self.parse_expr()
+            fields.append((fname, default))
+            if self.peek().type == 'COMMA':
+                self.advance()
+            else:
+                break
+        self.expect('RBRACE')
+        return StructDef(name, fields)
+
+    def parse_field_assign(self):
+        """v0.5 字段赋值: obj.field = expr（obj 为已存在的 IDENT 引用）"""
+        name = self.expect('IDENT').value
+        self.expect('DOT')
+        field = self.expect('IDENT').value
+        self.expect('OP', '=')
+        return FieldAssign(VarRef(name), field, self.parse_expr())
+
+    def parse_index_assign(self):
+        """v0.5 索引赋值: arr[i] = v / d[k] = v
+        通过解析为表达式后跟 '=' 识别。"""
+        name = self.expect('IDENT').value
+        self.expect('LBRACKET')
+        idx = self.parse_expr()
+        self.expect('RBRACKET')
+        self.expect('OP', '=')
+        return IndexAssign(VarRef(name), idx, self.parse_expr())
 
     def parse_for(self):
         self.expect('KEYWORD', 'for')
@@ -535,10 +632,21 @@ class Parser:
             else:
                 self.expect('RPAREN')
                 node = first
+        elif t.type == 'LBRACKET':
+            # v0.5 数组字面量: [a, b, c]（空数组 []）
+            self.advance()
+            el = []
+            if self.peek().type != 'RBRACKET':
+                el.append(self.parse_expr())
+                while self.peek().type == 'COMMA':
+                    self.advance()
+                    el.append(self.parse_expr())
+            self.expect('RBRACKET')
+            node = ArrayLit(el)
         elif t.type == 'IDENT':
             self.advance()
             name = t.value
-            if self.peek().type == 'LPAREN':  # 函数调用
+            if self.peek().type == 'LPAREN':  # 函数调用 / struct 构造
                 self.advance()
                 args, kwargs = [], {}
                 if self.peek().type != 'RPAREN':
@@ -562,6 +670,11 @@ class Parser:
             idx = self.parse_expr()
             self.expect('RBRACKET')
             node = IndexExpr(node, idx)
+        # v0.5 后缀字段访问: obj.field（支持连续 obj.a.b）
+        while self.peek().type == 'DOT':
+            self.advance()
+            field = self.expect('IDENT').value
+            node = FieldAccess(node, field)
         return node
 
 
@@ -616,6 +729,32 @@ class Closure:
         return f'<closure {self.name}({",".join(self.params)})>'
 
 
+class StructDefn:
+    """struct 类型定义对象（v0.5 §4.4）。
+    fields: [(name, default_value), ...]，default_value 为已求值的 Python 值。"""
+    __slots__ = ('name', 'fields')
+
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields  # list of (name, default_value)
+
+    def __repr__(self):
+        return f'<struct {self.name}>'
+
+
+class StructInstance:
+    """struct 实例对象（v0.5 §4.4）。fields 为 dict。"""
+    __slots__ = ('struct_name', 'fields')
+
+    def __init__(self, struct_name, fields):
+        self.struct_name = struct_name
+        self.fields = fields  # dict
+
+    def __repr__(self):
+        items = ', '.join(f'{k}={v!r}' for k, v in self.fields.items())
+        return f'<{self.struct_name} {items}>'
+
+
 def _bool_fn(x):
     """bool(x) 内建: 0/0.0/false → False, 否则 True (§6.1, §4.2)"""
     if isinstance(x, bool):
@@ -645,6 +784,71 @@ def _length(p1, p2):
     if len(p1) not in (2, 3):
         raise TypeError(f'length 仅支持 tuple(2) 或 tuple(3), 得到 tuple({len(p1)})')
     return (sum((a - b) ** 2 for a, b in zip(p1, p2))) ** 0.5
+
+
+# v0.5 复合数据内建函数（§6.3）
+def _len_fn(x):
+    """len(x): tuple / array / dict / string 的长度"""
+    if isinstance(x, (tuple, list, dict, str)):
+        return len(x)
+    raise TypeError(f'len 不支持 {type(x).__name__}')
+
+
+def _push_fn(arr, v):
+    """push(arr, v): array 末尾追加 v（原地修改，返回 None）"""
+    if not isinstance(arr, list):
+        raise TypeError(f'push 要求 array 参数, 得到 {type(arr).__name__}')
+    arr.append(v)
+    return None
+
+
+def _pop_fn(arr):
+    """pop(arr): array 末尾弹出"""
+    if not isinstance(arr, list):
+        raise TypeError(f'pop 要求 array 参数, 得到 {type(arr).__name__}')
+    if not arr:
+        raise ValueError('pop 空数组')
+    return arr.pop()
+
+
+def _array_fn(*args):
+    """array() → 空数组；array(n) → n 个 None 的数组；array(a, b, c) → [a, b, c]"""
+    if len(args) == 0:
+        return []
+    if len(args) == 1 and isinstance(args[0], (int, float)) and not isinstance(args[0], bool):
+        return [None] * int(args[0])
+    return list(args)
+
+
+def _dict_fn(*args):
+    """dict(k1, v1, k2, v2, ...): 交替键值构造字典"""
+    if len(args) % 2 != 0:
+        raise TypeError(f'dict 要求偶数个参数 (k, v 交替), 得到 {len(args)} 个')
+    d = {}
+    for i in range(0, len(args), 2):
+        d[args[i]] = args[i + 1]
+    return d
+
+
+def _keys_fn(d):
+    """keys(d): 返回 dict 键的 array"""
+    if not isinstance(d, dict):
+        raise TypeError(f'keys 要求 dict 参数, 得到 {type(d).__name__}')
+    return list(d.keys())
+
+
+def _values_fn(d):
+    """values(d): 返回 dict 值的 array"""
+    if not isinstance(d, dict):
+        raise TypeError(f'values 要求 dict 参数, 得到 {type(d).__name__}')
+    return list(d.values())
+
+
+def _has_fn(d, k):
+    """has(d, k): dict 是否含键 k"""
+    if not isinstance(d, dict):
+        raise TypeError(f'has 要求 dict 参数, 得到 {type(d).__name__}')
+    return k in d
 
 
 def _bezier(p1, p2, p3, p4):
@@ -684,6 +888,8 @@ class Interpreter:
         # funcs 不再单独存储：fn 定义在全局 env 中创建 Closure 绑定，
         # 闭包自带 def_env。保留 self.funcs 仅用于向后兼容旧式顶层 fn 调用检测。
         self.funcs = {}
+        # v0.5 struct 类型注册表：name -> StructDefn
+        self.structs = {}
         self.builtins = {
             'rand': lambda a, b: random.uniform(a, b),
             'int': int,
@@ -705,6 +911,15 @@ class Interpreter:
             'path': _path,
             'dot': _dot,
             'length': _length,
+            # v0.5 复合数据
+            'len': _len_fn,        # tuple/array/dict/str 长度
+            'push': _push_fn,      # array 末尾追加（原地修改）
+            'pop': _pop_fn,        # array 末尾弹出
+            'array': _array_fn,    # 构造空数组或指定大小数组
+            'dict': _dict_fn,      # 构造字典 dict(k1, v1, k2, v2, ...)
+            'keys': _keys_fn,      # dict 键数组
+            'values': _values_fn,  # dict 值数组
+            'has': _has_fn,        # dict 是否含键
         }
 
     def run(self, ast):
@@ -788,6 +1003,34 @@ class Interpreter:
             if target is None:
                 raise NameError(f'赋值给未声明变量: {stmt.name}（应使用 let 声明）')
             target.vars[stmt.name] = self.eval(stmt.expr, env)
+        elif isinstance(stmt, StructDef):
+            # v0.5 struct 定义：求值字段默认值，注册到 self.structs
+            fields = [(fname, self.eval(default, env)) for fname, default in stmt.fields]
+            self.structs[stmt.name] = StructDefn(stmt.name, fields)
+        elif isinstance(stmt, FieldAssign):
+            # v0.5 obj.field = expr
+            obj = self.eval(stmt.obj, env)
+            if not isinstance(obj, StructInstance):
+                raise TypeError(f'字段赋值要求 struct 实例, 得到 {type(obj).__name__}')
+            if stmt.name not in obj.fields:
+                raise AttributeError(f'struct {obj.struct_name} 无字段 {stmt.name}')
+            obj.fields[stmt.name] = self.eval(stmt.expr, env)
+        elif isinstance(stmt, IndexAssign):
+            # v0.5 arr[i] = v / d[k] = v
+            base = self.eval(stmt.base, env)
+            idx = self.eval(stmt.index, env)
+            val = self.eval(stmt.expr, env)
+            if isinstance(base, list):
+                if not isinstance(idx, (int, float)) or isinstance(idx, bool):
+                    raise TypeError(f'array 索引必须为整数, 得到 {type(idx).__name__}')
+                idx = int(idx)
+                if idx < 0 or idx >= len(base):
+                    raise IndexError(f'array 索引越界: {idx} (长度 {len(base)})')
+                base[idx] = val
+            elif isinstance(base, dict):
+                base[idx] = val  # dict 不存在则创建
+            else:
+                raise TypeError(f'索引赋值要求 array 或 dict, 得到 {type(base).__name__}')
         elif isinstance(stmt, ForStmt):
             start = self.eval(stmt.start, env)
             end = self.eval(stmt.end, env)
@@ -979,6 +1222,9 @@ class Interpreter:
             return target.vars[expr.name]
         if isinstance(expr, TupleLit):
             return tuple(self.eval(e, env) for e in expr.elements)
+        if isinstance(expr, ArrayLit):
+            # v0.5 数组字面量（Python list，可变）
+            return [self.eval(e, env) for e in expr.elements]
         if isinstance(expr, BinOp):
             l = self.eval(expr.left, env)
             r = self.eval(expr.right, env)
@@ -1015,21 +1261,36 @@ class Interpreter:
         if isinstance(expr, UnaryNot):
             return not self.truthy(self.eval(expr.expr, env))
         if isinstance(expr, IndexExpr):
-            # §3.3.4 tuple[i]，仅 tuple 支持索引
+            # v0.5: tuple[i] / array[i] / dict[k] / str[i] 通用索引
             base = self.eval(expr.base, env)
             idx = self.eval(expr.index, env)
-            if not isinstance(base, tuple):
-                raise TypeError(f'仅 tuple 支持索引, 得到 {type(base).__name__}')
-            if not isinstance(idx, (int, float)) or (isinstance(idx, bool)):
-                raise TypeError(f'索引必须为整数, 得到 {type(idx).__name__}')
-            idx = int(idx)
-            if idx < 0 or idx >= len(base):
-                raise IndexError(f'元组索引越界: {idx} (长度 {len(base)})')
-            return base[idx]
+            if isinstance(base, (tuple, list, str)):
+                if not isinstance(idx, (int, float)) or isinstance(idx, bool):
+                    raise TypeError(f'索引必须为整数, 得到 {type(idx).__name__}')
+                idx = int(idx)
+                if idx < 0 or idx >= len(base):
+                    raise IndexError(f'索引越界: {idx} (长度 {len(base)})')
+                return base[idx]
+            if isinstance(base, dict):
+                if idx not in base:
+                    raise KeyError(f'dict 无键: {idx!r}')
+                return base[idx]
+            raise TypeError(f'不支持索引的类型: {type(base).__name__}')
+        if isinstance(expr, FieldAccess):
+            # v0.5 struct 字段访问
+            obj = self.eval(expr.obj, env)
+            if not isinstance(obj, StructInstance):
+                raise TypeError(f'字段访问要求 struct 实例, 得到 {type(obj).__name__}')
+            if expr.name not in obj.fields:
+                raise AttributeError(f'struct {obj.struct_name} 无字段 {expr.name}')
+            return obj.fields[expr.name]
         if isinstance(expr, Call):
             name = expr.name
             arg_vals = [self.eval(a, env) for a in expr.args]
             kw_vals = {k: self.eval(v, env) for k, v in expr.kwargs.items()}
+            # v0.5 struct 构造：name 是已注册的 struct 类型
+            if name in self.structs:
+                return self._construct_struct(self.structs[name], arg_vals, kw_vals)
             # v0.3 优先：沿词法作用域链查找闭包（支持 let walk = ...; walk()）
             target_env = env.find_env(name)
             if target_env is not None and isinstance(target_env.vars[name], Closure):
@@ -1061,6 +1322,25 @@ class Interpreter:
         except ReturnSignal as ret:
             return ret.value
         return None
+
+    def _construct_struct(self, struct_defn, arg_vals, kw_vals):
+        """v0.5 struct 构造：先按字段定义顺序填充默认值，再用位置参数
+        和关键字参数覆盖。位置参数按字段定义顺序对应。"""
+        fields = {}
+        # 1. 默认值
+        for fname, default in struct_defn.fields:
+            fields[fname] = default
+        # 2. 位置参数覆盖（按定义顺序）
+        for i, val in enumerate(arg_vals):
+            if i >= len(struct_defn.fields):
+                raise TypeError(f'struct {struct_defn.name} 字段数 {len(struct_defn.fields)}, 得到 {len(arg_vals)} 个位置参数')
+            fields[struct_defn.fields[i][0]] = val
+        # 3. 关键字参数覆盖
+        for k, v in kw_vals.items():
+            if k not in fields:
+                raise TypeError(f'struct {struct_defn.name} 无字段 {k}')
+            fields[k] = v
+        return StructInstance(struct_defn.name, fields)
 
 
 # ============================================================
