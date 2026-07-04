@@ -5,6 +5,8 @@ VGL 最小解释器 — 单文件，仅依赖标准库
       v0.3: while / break / seed / 比较 < > <= >= == != / 逻辑 and or not / bool
             tuple 索引 / tuple 广播 / bezier / qbezier / path / dot / length
             pow / sqrt / 闭包（可变捕获）
+      v0.4: 块作用域（for/if/while/stroke 子 Environment）
+            continue / 带标签 break（label: for ... break label）
       表达式: + - * /  元组  变量  函数调用  颜色字面量 #rgb  true/false  tuple[i]
       内建函数: rand(a,b)  int(x)  abs(x)  floor(x)  ceil(x)  sin(x)  cos(x)
                 min(a,b)  max(a,b)  bool(x)  pow(a,b)  sqrt(x)
@@ -64,7 +66,9 @@ class Token:
 KEYWORDS = {'canvas', 'bg', 'let', 'for', 'in', 'if', 'else', 'fn', 'return',
             'pixel', 'stroke', 'render',
             # v0.3 新增
-            'while', 'break', 'and', 'or', 'not', 'seed', 'true', 'false'}
+            'while', 'break', 'and', 'or', 'not', 'seed', 'true', 'false',
+            # v0.4 新增
+            'continue'}
 
 
 def tokenize(src):
@@ -202,14 +206,20 @@ class AssignStmt:
     """裸赋值: name = expr（name 必须已存在，§3.2.3）"""
     def __init__(self, name, expr): self.name, self.expr = name, expr
 class ForStmt:
-    def __init__(self, var, start, end, body):
+    def __init__(self, var, start, end, body, label=None):
         self.var, self.start, self.end, self.body = var, start, end, body
+        self.label = label  # 带标签 break 用，§3.2.9.1
 class IfStmt:
     def __init__(self, cond, then_body, else_body):
         self.cond, self.then_body, self.else_body = cond, then_body, else_body
 class WhileStmt:
-    def __init__(self, cond, body): self.cond, self.body = cond, body
+    def __init__(self, cond, body, label=None):
+        self.cond, self.body, self.label = cond, body, label
 class BreakStmt:
+    """break [label]：无 label 终止最近循环；有 label 终止匹配标签的循环"""
+    def __init__(self, label=None): self.label = label
+class ContinueStmt:
+    """continue：跳过当前循环体剩余部分，进入下一次迭代"""
     pass
 class SeedStmt:
     def __init__(self, n): self.n = n
@@ -260,6 +270,14 @@ class Parser:
 
     def parse_stmt(self):
         t = self.peek()
+        # 带标签循环: IDENT ':' for/while ...（§3.2.9.1 带标签 break）
+        if t.type == 'IDENT' and self.peek(1).type == 'COLON' \
+                and self.peek(2).type == 'KEYWORD' and self.peek(2).value in ('for', 'while'):
+            label = self.advance().value
+            self.advance()  # consume ':'
+            stmt = self.parse_stmt()
+            stmt.label = label  # ForStmt / WhileStmt 均有 label 字段
+            return stmt
         if t.type == 'KEYWORD':
             dispatch = {
                 'canvas': self.parse_canvas, 'bg': self.parse_bg,
@@ -270,6 +288,8 @@ class Parser:
                 # v0.3 新增
                 'while': self.parse_while, 'break': self.parse_break,
                 'seed': self.parse_seed,
+                # v0.4 新增
+                'continue': self.parse_continue,
             }
             if t.value in dispatch:
                 return dispatch[t.value]()
@@ -346,7 +366,17 @@ class Parser:
         self.expect('KEYWORD', 'break')
         if self.loop_depth == 0:
             raise SyntaxError('break 只能出现在 for / while 循环体内')
-        return BreakStmt()
+        # 可选标签: break label（§3.2.9.1）
+        label = None
+        if self.peek().type == 'IDENT':
+            label = self.advance().value
+        return BreakStmt(label)
+
+    def parse_continue(self):
+        self.expect('KEYWORD', 'continue')
+        if self.loop_depth == 0:
+            raise SyntaxError('continue 只能出现在 for / while 循环体内')
+        return ContinueStmt()
 
     def parse_seed(self):
         self.expect('KEYWORD', 'seed')
@@ -544,7 +574,12 @@ class ReturnSignal(Exception):
 
 
 class BreakSignal(Exception):
-    """break 语句的信号，由 for/while 循环体捕获"""
+    """break 语句的信号，由 for/while 循环体捕获。label 为 None 表示无标签 break。"""
+    def __init__(self, label=None): self.label = label
+
+
+class ContinueSignal(Exception):
+    """continue 语句的信号，由 for/while 循环体捕获"""
     pass
 
 
@@ -758,31 +793,49 @@ class Interpreter:
             end = self.eval(stmt.end, env)
             i = start
             while i < end:
-                env.vars[stmt.var] = i
+                # v0.4 块作用域：每次迭代创建子 Environment（§5.1）
+                block_env = Environment(parent=env)
+                block_env.vars[stmt.var] = i
                 try:
                     for s in stmt.body:
-                        self.exec(s, env)
-                except BreakSignal:
-                    break
+                        self.exec(s, block_env)
+                except BreakSignal as bs:
+                    # 无标签 break 终止本循环；带标签 break 匹配则终止，否则向上传播
+                    if bs.label is None or bs.label == stmt.label:
+                        break
+                    raise
+                except ContinueSignal:
+                    pass  # continue 进入下一次迭代
                 i += 1
         elif isinstance(stmt, WhileStmt):
             while self.truthy(self.eval(stmt.cond, env)):
+                # v0.4 块作用域：每次迭代创建子 Environment（§5.1）
+                block_env = Environment(parent=env)
                 try:
                     for s in stmt.body:
-                        self.exec(s, env)
-                except BreakSignal:
-                    break
+                        self.exec(s, block_env)
+                except BreakSignal as bs:
+                    if bs.label is None or bs.label == stmt.label:
+                        break
+                    raise
+                except ContinueSignal:
+                    pass
         elif isinstance(stmt, BreakStmt):
-            raise BreakSignal()
+            raise BreakSignal(stmt.label)
+        elif isinstance(stmt, ContinueStmt):
+            raise ContinueSignal()
         elif isinstance(stmt, SeedStmt):
             random.seed(stmt.n)
         elif isinstance(stmt, IfStmt):
+            # v0.4 块作用域：if/else 体创建子 Environment（§5.1）
             if self.truthy(self.eval(stmt.cond, env)):
+                block_env = Environment(parent=env)
                 for s in stmt.then_body:
-                    self.exec(s, env)
+                    self.exec(s, block_env)
             elif stmt.else_body:
+                block_env = Environment(parent=env)
                 for s in stmt.else_body:
-                    self.exec(s, env)
+                    self.exec(s, block_env)
         elif isinstance(stmt, FnDef):
             # v0.3 闭包：捕获定义时环境 def_env（§5.3）
             closure = Closure(stmt.name, stmt.params, stmt.body, env)
@@ -812,7 +865,9 @@ class Interpreter:
             self.buf[idx + 2] = int(rgb[2]) & 0xff
 
     def exec_stroke(self, stmt, env):
-        f = {k: self.eval(v, env) for k, v in stmt.fields.items()}
+        # v0.4 块作用域：stroke 块创建子 Environment（§5.1，与 for/if 一致）
+        block_env = Environment(parent=env)
+        f = {k: self.eval(v, block_env) for k, v in stmt.fields.items()}
         path = f.get('path')
         width = int(f.get('width', 1))
         color = f.get('color', (0, 0, 0))
