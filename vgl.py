@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
 VGL 最小解释器 — 单文件，仅依赖标准库
-支持: canvas / bg / let / for / if / fn / return / pixel / stroke / render
+支持: canvas / bg / let / = / for / if / fn / return / pixel / stroke / render
       v0.3: while / break / seed / 比较 < > <= >= == != / 逻辑 and or not / bool
-      表达式: + - * /  元组  变量  函数调用  颜色字面量 #rgb  true/false
+            tuple 索引 / tuple 广播 / bezier / qbezier / path / dot / length
+            pow / sqrt
+      表达式: + - * /  元组  变量  函数调用  颜色字面量 #rgb  true/false  tuple[i]
       内建函数: rand(a,b)  int(x)  abs(x)  floor(x)  ceil(x)  sin(x)  cos(x)
-                min(a,b)  max(a,b)  bool(x)
+                min(a,b)  max(a,b)  bool(x)  pow(a,b)  sqrt(x)
                 line(p1,p2)  circle(cx,cy,r)
+                bezier(p1,p2,p3,p4)  qbezier(p1,p2,p3)  path(pts)
+                dot(a,b)  length(p1,p2)
 用法: python vgl.py <file.vgl>
 """
 
@@ -138,6 +142,7 @@ def tokenize(src):
             continue
         # 标点
         simple = {'(': 'LPAREN', ')': 'RPAREN', '{': 'LBRACE', '}': 'RBRACE',
+                  '[': 'LBRACKET', ']': 'RBRACKET',
                   ',': 'COMMA', ':': 'COLON'}
         if c in simple:
             toks.append(Token(simple[c], c, i))
@@ -181,6 +186,9 @@ class LogicOp:
     def __init__(self, op, l, r): self.op, self.left, self.right = op, l, r
 class UnaryNot:
     def __init__(self, expr): self.expr = expr
+class IndexExpr:
+    """tuple[i] 索引表达式（§3.3.4）"""
+    def __init__(self, base, index): self.base, self.index = base, index
 class Call:
     def __init__(self, name, args, kwargs):
         self.name, self.args, self.kwargs = name, args, kwargs
@@ -471,19 +479,20 @@ class Parser:
 
     def parse_primary(self):
         t = self.peek()
+        node = None
         if t.type == 'NUMBER':
             self.advance()
-            return Num(t.value)
-        if t.type == 'STRING':
+            node = Num(t.value)
+        elif t.type == 'STRING':
             self.advance()
-            return Str(t.value)
-        if t.type == 'COLOR':
+            node = Str(t.value)
+        elif t.type == 'COLOR':
             self.advance()
-            return ColorLit(t.value[0], t.value[1], t.value[2])
-        if t.type == 'KEYWORD' and t.value in ('true', 'false'):
+            node = ColorLit(t.value[0], t.value[1], t.value[2])
+        elif t.type == 'KEYWORD' and t.value in ('true', 'false'):
             self.advance()
-            return BoolLit(t.value == 'true')
-        if t.type == 'LPAREN':
+            node = BoolLit(t.value == 'true')
+        elif t.type == 'LPAREN':
             self.advance()
             first = self.parse_expr()
             if self.peek().type == 'COMMA':  # 元组
@@ -492,10 +501,11 @@ class Parser:
                     self.advance()
                     el.append(self.parse_expr())
                 self.expect('RPAREN')
-                return TupleLit(el)
-            self.expect('RPAREN')
-            return first
-        if t.type == 'IDENT':
+                node = TupleLit(el)
+            else:
+                self.expect('RPAREN')
+                node = first
+        elif t.type == 'IDENT':
             self.advance()
             name = t.value
             if self.peek().type == 'LPAREN':  # 函数调用
@@ -511,9 +521,18 @@ class Parser:
                             self.advance()
                             args.append(self.parse_expr())
                 self.expect('RPAREN')
-                return Call(name, args, kwargs)
-            return VarRef(name)
-        raise SyntaxError(f'意外标记 {t.type} {t.value!r} 于位置 {t.pos}')
+                node = Call(name, args, kwargs)
+            else:
+                node = VarRef(name)
+        else:
+            raise SyntaxError(f'意外标记 {t.type} {t.value!r} 于位置 {t.pos}')
+        # 后缀索引: base[i]（§3.3.4），支持连续索引 a[i][j]
+        while self.peek().type == 'LBRACKET':
+            self.advance()
+            idx = self.parse_expr()
+            self.expect('RBRACKET')
+            node = IndexExpr(node, idx)
+        return node
 
 
 # ============================================================
@@ -538,6 +557,56 @@ def _bool_fn(x):
     return bool(x)
 
 
+def _dot(a, b):
+    """dot(a, b) 点积 (§6.2)。要求 a, b 为同长度 tuple(2/3)。"""
+    if not (isinstance(a, tuple) and isinstance(b, tuple)):
+        raise TypeError(f'dot 要求两个 tuple 参数, 得到 {type(a).__name__}/{type(b).__name__}')
+    if len(a) != len(b):
+        raise TypeError(f'dot 要求同长度 tuple: {len(a)} vs {len(b)}')
+    if len(a) not in (2, 3):
+        raise TypeError(f'dot 仅支持 tuple(2) 或 tuple(3), 得到 tuple({len(a)})')
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _length(p1, p2):
+    """length(p1, p2) 欧氏距离 (§6.2)。"""
+    if not (isinstance(p1, tuple) and isinstance(p2, tuple)):
+        raise TypeError(f'length 要求两个 tuple 参数, 得到 {type(p1).__name__}/{type(p2).__name__}')
+    if len(p1) != len(p2):
+        raise TypeError(f'length 要求同长度 tuple: {len(p1)} vs {len(p2)}')
+    if len(p1) not in (2, 3):
+        raise TypeError(f'length 仅支持 tuple(2) 或 tuple(3), 得到 tuple({len(p1)})')
+    return (sum((a - b) ** 2 for a, b in zip(p1, p2))) ** 0.5
+
+
+def _bezier(p1, p2, p3, p4):
+    """三次贝塞尔 (§6.2)。返回 ('bezier', p1, p2, p3, p4) 标记元组。"""
+    for name, p in [('p1', p1), ('p2', p2), ('p3', p3), ('p4', p4)]:
+        if not (isinstance(p, tuple) and len(p) == 2):
+            raise TypeError(f'bezier 控制点 {name} 必须为 tuple(2), 得到 {type(p).__name__}')
+    return ('bezier', p1, p2, p3, p4)
+
+
+def _qbezier(p1, p2, p3):
+    """二次贝塞尔 (§6.2)。返回 ('qbezier', p1, p2, p3)。"""
+    for name, p in [('p1', p1), ('p2', p2), ('p3', p3)]:
+        if not (isinstance(p, tuple) and len(p) == 2):
+            raise TypeError(f'qbezier 控制点 {name} 必须为 tuple(2), 得到 {type(p).__name__}')
+    return ('qbezier', p1, p2, p3)
+
+
+def _path(points):
+    """折线 path (§6.2)。points: tuple of tuple(2)。"""
+    if not isinstance(points, tuple):
+        raise TypeError(f'path 要求 tuple 参数, 得到 {type(points).__name__}')
+    if len(points) < 2:
+        raise TypeError(f'path 至少需要 2 个点, 得到 {len(points)}')
+    for i, p in enumerate(points):
+        if not (isinstance(p, tuple) and len(p) == 2):
+            raise TypeError(f'path 第 {i} 个点必须为 tuple(2), 得到 {type(p).__name__}')
+    return ('polyline', points)
+
+
 class Interpreter:
     def __init__(self):
         self.cw = 0
@@ -556,8 +625,16 @@ class Interpreter:
             'min': min,
             'max': max,
             'bool': _bool_fn,  # v0.3
+            'pow': math.pow,   # v0.3
+            'sqrt': math.sqrt,  # v0.3
             'line': lambda p1, p2: ('line', p1, p2),
             'circle': lambda cx, cy, r: ('circle', cx, cy, r),
+            # v0.3 几何扩展
+            'bezier': _bezier,
+            'qbezier': _qbezier,
+            'path': _path,
+            'dot': _dot,
+            'length': _length,
         }
 
     def run(self, ast):
@@ -574,6 +651,54 @@ class Interpreter:
         if v is None:
             return False
         return bool(v)
+
+    @staticmethod
+    def _is_num(v):
+        """number 判定（bool 在 Python 中是 int 子类，需排除）"""
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    def _binop_arith(self, op, l, r):
+        """§4.3 元组广播运算。返回 None 表示两侧均非 tuple，调用方走普通算术。"""
+        l_is_tup = isinstance(l, tuple)
+        r_is_tup = isinstance(r, tuple)
+        if not l_is_tup and not r_is_tup:
+            return None  # 普通数值算术，交给后续分支
+
+        # tuple ± tuple（要求同长度）
+        if l_is_tup and r_is_tup:
+            if len(l) != len(r):
+                raise TypeError(f'元组长度不匹配: {len(l)} vs {len(r)}')
+            if op == '+':
+                return tuple(a + b for a, b in zip(l, r))
+            if op == '-':
+                return tuple(a - b for a, b in zip(l, r))
+            if op == '*':
+                raise TypeError('tuple * tuple 非法（使用 dot() 计算点积）')
+            if op == '/':
+                raise TypeError('tuple / tuple 非法')
+
+        # tuple * number / number * tuple（标量广播）
+        if op == '*':
+            if l_is_tup and self._is_num(r):
+                return tuple(a * r for a in l)
+            if r_is_tup and self._is_num(l):
+                return tuple(l * a for a in r)
+            raise TypeError(f'tuple * <非 number> 非法: {type(r if l_is_tup else l).__name__}')
+
+        # tuple / number（仅 tuple 在左）
+        if op == '/':
+            if l_is_tup and self._is_num(r):
+                if r == 0:
+                    raise ZeroDivisionError('tuple 除以零')
+                return tuple(a / r for a in l)
+            # number / tuple 或 tuple / tuple 已在前面处理
+            raise TypeError('仅支持 tuple / number')
+
+        # tuple ± number（非法，§4.3 表格明确禁止）
+        if op in ('+', '-'):
+            raise TypeError(f'tuple {op} number 非法（歧义：标量广播？拼接？）')
+
+        return None
 
     # --- 语句执行 ---
 
@@ -658,6 +783,7 @@ class Interpreter:
         if not isinstance(color, tuple):
             color = (0, 0, 0)
         r, g, b = color[0], color[1], color[2]
+        samples = int(f.get('samples', 0))  # 0 表示用默认采样数
 
         if path and path[0] == 'line':
             p1, p2 = path[1], path[2]
@@ -665,6 +791,56 @@ class Interpreter:
         elif path and path[0] == 'circle':
             cx, cy, rad = int(path[1]), int(path[2]), int(path[3])
             self.draw_circle(cx, cy, rad, width, r, g, b)
+        elif path and path[0] == 'bezier':
+            # 三次贝塞尔 (§6.2)：de Casteljau 采样 N 个点，相邻点连线
+            p1, p2, p3, p4 = path[1], path[2], path[3], path[4]
+            n = samples if samples > 0 else 64
+            pts = self._sample_bezier3(p1, p2, p3, p4, n)
+            self._draw_polyline(pts, width, r, g, b)
+        elif path and path[0] == 'qbezier':
+            # 二次贝塞尔：de Casteljau 二次形式
+            p1, p2, p3 = path[1], path[2], path[3]
+            n = samples if samples > 0 else 32
+            pts = self._sample_bezier2(p1, p2, p3, n)
+            self._draw_polyline(pts, width, r, g, b)
+        elif path and path[0] == 'polyline':
+            # 折线：连接所有点
+            points = path[1]
+            self._draw_polyline(points, width, r, g, b)
+
+    @staticmethod
+    def _lerp(p1, p2, t):
+        """线性插值两点"""
+        return (p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t)
+
+    def _sample_bezier2(self, p1, p2, p3, n):
+        """二次贝塞尔 de Casteljau 采样"""
+        pts = []
+        for i in range(n + 1):
+            t = i / n
+            q0 = self._lerp(p1, p2, t)
+            q1 = self._lerp(p2, p3, t)
+            pts.append(self._lerp(q0, q1, t))
+        return pts
+
+    def _sample_bezier3(self, p1, p2, p3, p4, n):
+        """三次贝塞尔 de Casteljau 采样"""
+        pts = []
+        for i in range(n + 1):
+            t = i / n
+            q0 = self._lerp(p1, p2, t)
+            q1 = self._lerp(p2, p3, t)
+            q2 = self._lerp(p3, p4, t)
+            r0 = self._lerp(q0, q1, t)
+            r1 = self._lerp(q1, q2, t)
+            pts.append(self._lerp(r0, r1, t))
+        return pts
+
+    def _draw_polyline(self, points, width, r, g, b):
+        """连接一系列点为折线段"""
+        for i in range(len(points) - 1):
+            p1, p2 = points[i], points[i + 1]
+            self.draw_line(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]), width, r, g, b)
 
     def draw_line(self, x0, y0, x1, y1, w, r, g, b):
         dx, dy = abs(x1 - x0), abs(y1 - y0)
@@ -715,6 +891,12 @@ class Interpreter:
         if isinstance(expr, BinOp):
             l = self.eval(expr.left, env)
             r = self.eval(expr.right, env)
+            # v0.3 §4.3 元组广播运算
+            if expr.op in ('+', '-', '*', '/'):
+                result = self._binop_arith(expr.op, l, r)
+                if result is not None:
+                    return result
+                # 落到此处说明非法组合
             if expr.op == '+': return l + r
             if expr.op == '-': return l - r
             if expr.op == '*': return l * r
@@ -741,6 +923,18 @@ class Interpreter:
                 return bool(self.truthy(self.eval(expr.right, env)))
         if isinstance(expr, UnaryNot):
             return not self.truthy(self.eval(expr.expr, env))
+        if isinstance(expr, IndexExpr):
+            # §3.3.4 tuple[i]，仅 tuple 支持索引
+            base = self.eval(expr.base, env)
+            idx = self.eval(expr.index, env)
+            if not isinstance(base, tuple):
+                raise TypeError(f'仅 tuple 支持索引, 得到 {type(base).__name__}')
+            if not isinstance(idx, (int, float)) or (isinstance(idx, bool)):
+                raise TypeError(f'索引必须为整数, 得到 {type(idx).__name__}')
+            idx = int(idx)
+            if idx < 0 or idx >= len(base):
+                raise IndexError(f'元组索引越界: {idx} (长度 {len(base)})')
+            return base[idx]
         if isinstance(expr, Call):
             name = expr.name
             arg_vals = [self.eval(a, env) for a in expr.args]
