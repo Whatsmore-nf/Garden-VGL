@@ -1,14 +1,12 @@
 # 输出目录（运行时生成的图像）
 output/
 
-# Python
+# Rust
+target/
+
+# Python 缓存
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
-.pytest_cache/
 
 # 虚拟环境
 venv/
