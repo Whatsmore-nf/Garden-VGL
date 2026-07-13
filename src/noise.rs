@@ -63,6 +63,47 @@ pub fn perlin(x: f64, y: f64) -> f64 {
     lerp(x1, x2, v)
 }
 
+/// v0.8 可种子化的 Perlin 噪声
+/// 用种子生成置换表，使 seed 语句能影响 perlin/worley/fbm 的输出
+pub fn seeded_perm(seed: u64) -> [usize; 512] {
+    // 用 LCG 生成 0..255 的随机排列
+    let mut perm = [0usize; 256];
+    for i in 0..256 {
+        perm[i] = i;
+    }
+    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    // Fisher-Yates 洗牌
+    for i in (1..256).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (state >> 33) as usize % (i + 1);
+        perm.swap(i, j);
+    }
+    let mut p = [0usize; 512];
+    for i in 0..256 {
+        p[i] = perm[i];
+        p[i + 256] = perm[i];
+    }
+    p
+}
+
+/// v0.8 可种子化的 Perlin 噪声（使用外部置换表）
+pub fn perlin_seeded(x: f64, y: f64, perm: &[usize; 512]) -> f64 {
+    let xi = x.floor() as i32 & 255;
+    let yi = y.floor() as i32 & 255;
+    let xf = x - x.floor();
+    let yf = y - y.floor();
+    let u = fade(xf);
+    let v = fade(yf);
+    let p = perm;
+    let aaa = p[p[xi as usize] + yi as usize];
+    let aba = p[p[xi as usize] + yi as usize + 1];
+    let baa = p[p[xi as usize + 1] + yi as usize];
+    let bba = p[p[xi as usize + 1] + yi as usize + 1];
+    let x1 = lerp(grad(aaa, xf, yf), grad(baa, xf - 1.0, yf), u);
+    let x2 = lerp(grad(aba, xf, yf - 1.0), grad(bba, xf - 1.0, yf - 1.0), u);
+    lerp(x1, x2, v)
+}
+
 /// v0.5 修复：使用 i64 避免溢出
 pub fn worley(x: f64, y: f64) -> f64 {
     let cell_size = 32.0;

@@ -32,6 +32,7 @@ pub enum Stmt {
     Let(String, Expr),
     Assign(String, Expr),
     For(String, Expr, Expr, Vec<StmtWithPos>, Option<String>), // 最后为 label
+    ForIn(String, Expr, Vec<StmtWithPos>, Option<String>), // v0.8 for-in-array: var, array_expr, body, label
     While(Expr, Vec<StmtWithPos>, Option<String>),
     If(Expr, Vec<StmtWithPos>, Option<Vec<StmtWithPos>>),
     Break(Option<String>), // v0.4 带标签 break

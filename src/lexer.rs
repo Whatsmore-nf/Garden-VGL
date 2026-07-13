@@ -239,11 +239,13 @@ impl Lexer {
             ',' => { self.advance(); Token::Comma }
             ':' => { self.advance(); Token::Colon }
             '.' => { self.advance(); Token::Dot }
-            '+' | '-' | '*' | '/' | '=' | '<' | '>' | '!' => {
+            // v0.8: 添加 % 单字符运算符；扩展双字符识别以支持复合赋值 += -= *= /= %=
+            '+' | '-' | '*' | '/' | '=' | '<' | '>' | '!' | '%' => {
                 self.advance();
                 let mut op = c.to_string();
                 if let Some(nxt) = self.peek() {
-                    if (c == '<' || c == '>' || c == '=' || c == '!') && nxt == '=' {
+                    // 双字符运算符：==, !=, <=, >= 以及复合赋值 +=, -=, *=, /=, %=
+                    if nxt == '=' && matches!(c, '<' | '>' | '=' | '!' | '+' | '-' | '*' | '/' | '%') {
                         self.advance();
                         op.push('=');
                     }

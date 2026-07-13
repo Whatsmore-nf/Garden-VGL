@@ -61,7 +61,7 @@ impl Parser {
                     let mut s = self.parse_stmt()?;
                     // 注入 label
                     match &mut s.stmt {
-                        Stmt::For(_, _, _, _, l) | Stmt::While(_, _, l) => {
+                        Stmt::For(_, _, _, _, l) | Stmt::ForIn(_, _, _, l) | Stmt::While(_, _, l) => {
                             *l = Some(label);
                         }
                         _ => {}
@@ -122,17 +122,32 @@ impl Parser {
                     };
                     self.expect(&Token::Keyword("in".to_string()))?;
                     let start = self.parse_expr()?;
-                    self.expect(&Token::DotDot)?;
-                    let end = self.parse_expr()?;
-                    self.expect(&Token::LBrace)?;
-                    self.loop_depth += 1;
-                    let mut body = Vec::new();
-                    while !matches!(self.peek(), Token::RBrace) {
-                        body.push(self.parse_stmt()?);
+                    // v0.8: 支持 for-in-array 遍历。若解析 expr 后遇到 .. 则为范围 for，否则为数组遍历
+                    if matches!(self.peek(), Token::DotDot) {
+                        // 范围 for: for var in start..end { ... }
+                        self.advance(); // 消费 ..
+                        let end = self.parse_expr()?;
+                        self.expect(&Token::LBrace)?;
+                        self.loop_depth += 1;
+                        let mut body = Vec::new();
+                        while !matches!(self.peek(), Token::RBrace) {
+                            body.push(self.parse_stmt()?);
+                        }
+                        self.loop_depth -= 1;
+                        self.expect(&Token::RBrace)?;
+                        Ok(Stmt::For(var, start, end, body, None))
+                    } else {
+                        // 数组遍历 for-in: for var in array_expr { ... }
+                        self.expect(&Token::LBrace)?;
+                        self.loop_depth += 1;
+                        let mut body = Vec::new();
+                        while !matches!(self.peek(), Token::RBrace) {
+                            body.push(self.parse_stmt()?);
+                        }
+                        self.loop_depth -= 1;
+                        self.expect(&Token::RBrace)?;
+                        Ok(Stmt::ForIn(var, start, body, None))
                     }
-                    self.loop_depth -= 1;
-                    self.expect(&Token::RBrace)?;
-                    Ok(Stmt::For(var, start, end, body, None))
                 }
                 "while" => {
                     self.advance();
@@ -158,13 +173,20 @@ impl Parser {
                     self.expect(&Token::RBrace)?;
                     let else_body = if matches!(self.peek(), Token::Keyword(ref k) if k == "else") {
                         self.advance();
-                        self.expect(&Token::LBrace)?;
-                        let mut b = Vec::new();
-                        while !matches!(self.peek(), Token::RBrace) {
-                            b.push(self.parse_stmt()?);
+                        // v0.8: else-if 链。else 后若为 if 关键字则递归解析为嵌套 if（包装成单语句块）
+                        if matches!(self.peek(), Token::Keyword(ref k) if k == "if") {
+                            let nested_if = self.parse_stmt()?;
+                            Some(vec![nested_if])
+                        } else {
+                            // 原有逻辑：解析 else 块
+                            self.expect(&Token::LBrace)?;
+                            let mut b = Vec::new();
+                            while !matches!(self.peek(), Token::RBrace) {
+                                b.push(self.parse_stmt()?);
+                            }
+                            self.expect(&Token::RBrace)?;
+                            Some(b)
                         }
-                        self.expect(&Token::RBrace)?;
-                        Some(b)
                     } else {
                         None
                     };
@@ -388,6 +410,18 @@ impl Parser {
                 self.advance();
                 return Ok(Stmt::Assign(name, self.parse_expr()?));
             }
+            // v0.8: 复合赋值运算符 += -= *= /= %=
+            // x op= e 转换为 x = x op e
+            if matches!(op.as_str(), "+=" | "-=" | "*=" | "/=" | "%=") {
+                let op_pos = self.peek_pos();
+                // 取出基础运算符（去掉末尾 '='）
+                let binop = op.chars().next().unwrap().to_string();
+                self.advance();
+                let rhs = self.parse_expr()?;
+                let lhs = Expr::Ident(name.clone());
+                let combined = Expr::BinOp(binop, Box::new(lhs), Box::new(rhs), op_pos);
+                return Ok(Stmt::Assign(name, combined));
+            }
         }
         // 索引赋值
         if matches!(self.peek(), Token::LBracket) {
@@ -551,7 +585,8 @@ impl Parser {
     pub fn parse_mul(&mut self) -> VglResult<Expr> {
         let mut left = self.parse_unary()?;
         while let Token::Op(ref op) = self.peek() {
-            if op == "*" || op == "/" {
+            // v0.8: 添加 % 作为乘法级运算符
+            if op == "*" || op == "/" || op == "%" {
                 let op_pos = self.peek_pos();
                 let op = self.advance();
                 let right = self.parse_unary()?;

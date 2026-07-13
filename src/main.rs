@@ -1,5 +1,5 @@
-// VGL 解释器 — Rust 版（v0.75 完整实现）
-// 对应规范: VGL_语法规范 v0.5.txt（v0.6 修订）
+// VGL 解释器 — Rust 版（v0.8 大版本：图像质量飞跃）
+// 对应规范: VGL_语法规范 v0.5.txt（v0.8 修订）
 // 用法:
 //   vgl [--continue-on-error] <file.vgl>
 //   vgl replicate --mode pixel <input.png> <output.vgl>

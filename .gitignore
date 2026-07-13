@@ -1,5 +1,7 @@
 # 输出目录（运行时生成的图像）
 output/
+# 根目录渲染产物（render "xxx.png" 相对路径输出）
+*.png
 
 # Rust
 target/

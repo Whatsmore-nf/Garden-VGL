@@ -16,7 +16,7 @@ use crate::ast::{Env, Expr, Stmt, StmtWithPos, Value};
 use crate::canvas::{Canvas, MaterialParams};
 use crate::error::{clamp_f32, clamp_u8, format_error, VglError, VglResult};
 use crate::lexer::Lexer;
-use crate::noise::{fbm, perlin, worley};
+use crate::noise::{fbm, perlin, perlin_seeded, worley};
 use crate::parser::Parser;
 
 #[derive(Debug)]
@@ -33,6 +33,54 @@ pub type ExecResult = Result<Control, VglError>;
 // 解释器
 // ============================================================
 
+/// v0.8 2D 变换矩阵（2x3 仿射变换）
+#[derive(Clone, Debug)]
+pub struct Transform {
+    pub a: f64, pub b: f64, // 第一行: a*c + e = x'
+    pub c: f64, pub d: f64, // 第二行: b*c + f = y'
+    pub e: f64, pub f: f64, // 平移
+}
+
+impl Transform {
+    pub fn identity() -> Self {
+        Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+    }
+    /// 应用变换到点 (x, y)
+    pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+    }
+    /// 矩阵乘法 self * other（先 other 后 self）
+    pub fn compose(&self, other: &Transform) -> Transform {
+        Transform {
+            a: self.a * other.a + self.c * other.b,
+            b: self.b * other.a + self.d * other.b,
+            c: self.a * other.c + self.c * other.d,
+            d: self.b * other.c + self.d * other.d,
+            e: self.a * other.e + self.c * other.f + self.e,
+            f: self.b * other.e + self.d * other.f + self.f,
+        }
+    }
+    pub fn translate(tx: f64, ty: f64) -> Self {
+        Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
+    }
+    pub fn rotate(rad: f64) -> Self {
+        let (s, c) = rad.sin_cos();
+        Transform { a: c, b: s, c: -s, d: c, e: 0.0, f: 0.0 }
+    }
+    pub fn scale(sx: f64, sy: f64) -> Self {
+        Transform { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 }
+    }
+}
+
+/// v0.8 裁剪矩形
+#[derive(Clone, Debug)]
+pub struct ClipRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
 pub struct Interpreter {
     pub canvas: Option<Canvas>,
     pub layers: HashMap<String, Value>,
@@ -45,6 +93,9 @@ pub struct Interpreter {
     pub current_pos: Option<usize>,
     pub warnings: Vec<crate::error::VglWarning>,
     pub bg_set: bool,
+    pub transform_stack: Vec<Transform>,  // v0.8 变换栈
+    pub clip_stack: Vec<ClipRect>,         // v0.8 裁剪栈
+    pub noise_perm: Option<[usize; 512]>,  // v0.8 可种子化 Perlin 置换表
 }
 
 impl Interpreter {
@@ -61,6 +112,9 @@ impl Interpreter {
             current_pos: None,
             warnings: Vec::new(),
             bg_set: false,
+            transform_stack: vec![Transform::identity()],
+            clip_stack: Vec::new(),
+            noise_perm: None,
         }
     }
 
@@ -107,6 +161,13 @@ impl Interpreter {
                             "-" => a - b,
                             "*" => a * b,
                             "/" => a / b,
+                            // v0.8: 取模运算符
+                            "%" => {
+                                if *b == 0.0 {
+                                    return Err(VglError::new("取模除零错误", self.current_pos));
+                                }
+                                a % b
+                            }
                             "<" => return Ok(Value::Bool(a < b)),
                             ">" => return Ok(Value::Bool(a > b)),
                             "<=" => return Ok(Value::Bool(a <= b)),
@@ -304,6 +365,33 @@ impl Interpreter {
                 arg_vals.push(self.eval(a, env.clone())?);
             }
             self.apply_fill(name, &arg_vals)?;
+            return Ok(Value::None);
+        }
+        // v0.8 变换 & 裁剪
+        if matches!(name, "translate" | "rotate" | "scale" | "push_transform" | "pop_transform" | "clip_rect" | "clip_clear") {
+            let mut arg_vals = Vec::new();
+            for a in args {
+                arg_vals.push(self.eval(a, env.clone())?);
+            }
+            self.apply_transform(name, &arg_vals)?;
+            return Ok(Value::None);
+        }
+        // v0.8 渐变填充函数（直接绘制，不经 stroke）
+        if matches!(name, "fill_linear_gradient" | "fill_radial_gradient") {
+            let mut arg_vals = Vec::new();
+            for a in args {
+                arg_vals.push(self.eval(a, env.clone())?);
+            }
+            self.apply_gradient(name, &arg_vals)?;
+            return Ok(Value::None);
+        }
+        // v0.8 文本绘制函数
+        if name == "text" {
+            let mut arg_vals = Vec::new();
+            for a in args {
+                arg_vals.push(self.eval(a, env.clone())?);
+            }
+            self.apply_text(&arg_vals)?;
             return Ok(Value::None);
         }
         // struct 构造
@@ -769,7 +857,14 @@ impl Interpreter {
                 };
                 Value::Number(d)
             }
-            "perlin" => Value::Number(perlin(num!(0), num!(1))),
+            "perlin" => {
+                let v = if let Some(perm) = &self.noise_perm {
+                    perlin_seeded(num!(0), num!(1), perm)
+                } else {
+                    perlin(num!(0), num!(1))
+                };
+                Value::Number(v)
+            }
             "worley" => Value::Number(worley(num!(0), num!(1))),
             "fbm" => {
                 let o = args.get(2).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(4);
@@ -909,6 +1004,34 @@ impl Interpreter {
                 }
                 Ok(Control::Normal)
             }
+            // v0.8: for-in-array 遍历
+            Stmt::ForIn(var, arr_expr, body, label) => {
+                let arr_val = self.eval(arr_expr, env.clone())?;
+                let items = match arr_val {
+                    Value::Array(arr) => arr.borrow().clone(),
+                    Value::Tuple(t) => t,
+                    _ => return Err(VglError::new("for-in 需要数组或元组", self.current_pos)),
+                };
+                for item in items {
+                    let block_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
+                    block_env.borrow_mut().vars.insert(var.clone(), item);
+                    match self.execute_block(body, block_env)? {
+                        Control::Normal => {}
+                        Control::Continue => {}
+                        Control::Break(None) => break,
+                        Control::Break(Some(l)) => {
+                            // 匹配 label：若匹配则终止本循环，否则向上传播
+                            if label.as_deref() == Some(l.as_str()) {
+                                break;
+                            } else {
+                                return Ok(Control::Break(Some(l)));
+                            }
+                        }
+                        Control::Return(v) => return Ok(Control::Return(v)),
+                    }
+                }
+                Ok(Control::Normal)
+            }
             Stmt::While(cond, body, label) => {
                 loop {
                     let cond_val = self.eval(cond, env.clone())?;
@@ -962,6 +1085,8 @@ impl Interpreter {
             Stmt::Continue => Ok(Control::Continue),
             Stmt::Seed(n) => {
                 *self.rng.borrow_mut() = StdRng::seed_from_u64(*n);
+                // v0.8 同步生成噪声置换表，使 seed 也影响 perlin/worley/fbm
+                self.noise_perm = Some(crate::noise::seeded_perm(*n));
                 Ok(Control::Normal)
             }
             Stmt::FnDef(name, params, body) => {
@@ -977,8 +1102,8 @@ impl Interpreter {
                 Ok(Control::Return(val))
             }
             Stmt::Pixel(x_expr, y_expr, rgb_expr) => {
-                let x = self.eval(x_expr, env.clone())?.as_number().unwrap_or(0.0) as i32;
-                let y = self.eval(y_expr, env.clone())?.as_number().unwrap_or(0.0) as i32;
+                let x = self.eval(x_expr, env.clone())?.as_number().unwrap_or(0.0);
+                let y = self.eval(y_expr, env.clone())?.as_number().unwrap_or(0.0);
                 let rgb_val = self.eval(rgb_expr, env.clone())?;
                 let (r, g, b) = match rgb_val {
                     Value::Color(r, g, b) => (r as f32, g as f32, b as f32),
@@ -992,8 +1117,16 @@ impl Interpreter {
                         unreachable!()
                     }
                 };
+                // v0.8 应用变换
+                let (tx, ty) = self.current_transform().apply(x, y);
+                let px = tx.round() as i32;
+                let py = ty.round() as i32;
+                // v0.8 裁剪检查
+                if self.is_clipped(px, py) {
+                    return Ok(Control::Normal);
+                }
                 if let Some(canvas) = &mut self.canvas {
-                    canvas.put_pixel(x, y, r, g, b);
+                    canvas.put_pixel(px, py, r, g, b);
                 }
                 Ok(Control::Normal)
             }
@@ -1101,15 +1234,9 @@ impl Interpreter {
 
     /// 辅助：产生 VglError 并打印后退出。返回类型为 ExecResult 以便在 exec 中用 ? 传播。
     /// 实际上它直接 std::process::exit，返回值仅为满足类型检查。
+    /// v0.8 错误恢复：不再直接 exit，而是返回 VglError 由上层处理
     pub fn eval_error(&self, msg: &str) -> Result<Control, VglError> {
-        let full = format_error(
-            msg,
-            &self.current_src,
-            self.current_pos,
-            &self.current_filename,
-        );
-        eprintln!("VGL 错误: {}", full);
-        std::process::exit(1);
+        Err(VglError::new(msg, self.current_pos))
     }
 
     pub fn exec_stroke(&mut self, fields: &HashMap<String, Expr>, env: Rc<RefCell<Env>>) -> ExecResult {
@@ -1119,6 +1246,26 @@ impl Interpreter {
             fields.get("path").unwrap_or(&Expr::Ident("none".into())),
             block_env.clone(),
         )?;
+        // v0.8 应用变换到 Path 的坐标参数
+        let path_val = if let Value::Path(tag, args) = &path_val {
+            let t = self.current_transform().clone();
+            let new_args: Vec<Value> = args.iter().map(|v| {
+                if let Value::Tuple(tup) = v {
+                    if tup.len() >= 2 {
+                        let x = tup[0].as_number().unwrap_or(0.0);
+                        let y = tup[1].as_number().unwrap_or(0.0);
+                        let (nx, ny) = t.apply(x, y);
+                        Value::Tuple(vec![Value::Number(nx), Value::Number(ny)])
+                    } else { v.clone() }
+                } else if let Value::Number(_) = v {
+                    // 标量参数（如 circle 的 radius、rect 的 w/h）不变换
+                    v.clone()
+                } else { v.clone() }
+            }).collect();
+            Value::Path(tag.clone(), new_args)
+        } else {
+            path_val
+        };
         let width = self
             .eval(fields.get("width").unwrap_or(&Expr::Number(1.0)), block_env.clone())?
             .as_number()
@@ -1552,6 +1699,91 @@ impl Interpreter {
         Ok(Value::Struct(Rc::new(RefCell::new(fields))))
     }
 
+    /// v0.8 变换 & 裁剪
+    pub fn apply_transform(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
+        let n = |idx: usize| -> f64 {
+            args.get(idx).and_then(|v| v.as_number()).unwrap_or(0.0)
+        };
+        match name {
+            "translate" => {
+                // translate(tx, ty)：在当前变换上叠加平移
+                let t = Transform::translate(n(0), n(1));
+                let cur = self.transform_stack.last().cloned().unwrap_or_else(Transform::identity);
+                *self.transform_stack.last_mut().unwrap() = cur.compose(&t);
+            }
+            "rotate" => {
+                // rotate(rad)：在当前变换上叠加旋转（弧度）
+                let t = Transform::rotate(n(0));
+                let cur = self.transform_stack.last().cloned().unwrap_or_else(Transform::identity);
+                *self.transform_stack.last_mut().unwrap() = cur.compose(&t);
+            }
+            "scale" => {
+                // scale(sx, sy)：在当前变换上叠加缩放
+                let sx = n(0);
+                let sy = if args.len() > 1 { n(1) } else { sx };
+                let t = Transform::scale(sx, sy);
+                let cur = self.transform_stack.last().cloned().unwrap_or_else(Transform::identity);
+                *self.transform_stack.last_mut().unwrap() = cur.compose(&t);
+            }
+            "push_transform" => {
+                // push_transform()：压入当前变换的副本
+                let cur = self.transform_stack.last().cloned().unwrap_or_else(Transform::identity);
+                self.transform_stack.push(cur);
+            }
+            "pop_transform" => {
+                // pop_transform()：弹出变换栈（保留至少一个）
+                if self.transform_stack.len() > 1 {
+                    self.transform_stack.pop();
+                } else {
+                    return Err(VglError::new("pop_transform 栈下溢", self.current_pos));
+                }
+            }
+            "clip_rect" => {
+                // clip_rect(x, y, w, h)：压入裁剪矩形（与栈顶求交集）
+                let x = n(0) as i32;
+                let y = n(1) as i32;
+                let w = n(2) as i32;
+                let h = n(3) as i32;
+                let new_clip = ClipRect { x, y, w, h };
+                if let Some(parent) = self.clip_stack.last() {
+                    // 求交集
+                    let ix = x.max(parent.x);
+                    let iy = y.max(parent.y);
+                    let ix2 = (x + w).min(parent.x + parent.w);
+                    let iy2 = (y + h).min(parent.y + parent.h);
+                    self.clip_stack.push(ClipRect {
+                        x: ix,
+                        y: iy,
+                        w: (ix2 - ix).max(0),
+                        h: (iy2 - iy).max(0),
+                    });
+                } else {
+                    self.clip_stack.push(new_clip);
+                }
+            }
+            "clip_clear" => {
+                // clip_clear()：清空裁剪栈
+                self.clip_stack.clear();
+            }
+            _ => return Err(VglError::new(format!("未知变换: {}", name), self.current_pos)),
+        }
+        Ok(())
+    }
+
+    /// v0.8 获取当前变换
+    pub fn current_transform(&self) -> &Transform {
+        self.transform_stack.last().unwrap_or(&Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 })
+    }
+
+    /// v0.8 检查像素是否在裁剪区域内
+    pub fn is_clipped(&self, x: i32, y: i32) -> bool {
+        if let Some(clip) = self.clip_stack.last() {
+            x < clip.x || y < clip.y || x >= clip.x + clip.w || y >= clip.y + clip.h
+        } else {
+            false
+        }
+    }
+
     /// v0.75 填充函数：fill_rect / fill_circle / fill_ellipse / fill_polygon / flood_fill
     pub fn apply_fill(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
         let canvas = match &mut self.canvas {
@@ -1723,6 +1955,150 @@ impl Interpreter {
         Ok(())
     }
 
+    /// v0.8 渐变填充：fill_linear_gradient / fill_radial_gradient
+    /// 直接在画布上绘制渐变，覆盖整个画布像素
+    pub fn apply_gradient(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
+        // 提取颜色参数（支持 (r,g,b) 元组或 #color）
+        let extract_color = |idx: usize| -> (f32, f32, f32) {
+            match args.get(idx) {
+                Some(Value::Tuple(t)) if t.len() >= 3 => (
+                    t[0].as_number().unwrap_or(0.0) as f32,
+                    t[1].as_number().unwrap_or(0.0) as f32,
+                    t[2].as_number().unwrap_or(0.0) as f32,
+                ),
+                Some(Value::Color(r, g, b)) => (*r as f32, *g as f32, *b as f32),
+                _ => (0.0, 0.0, 0.0),
+            }
+        };
+        // 提取数值参数
+        let n = |idx: usize| -> f64 {
+            args.get(idx).and_then(|v| v.as_number()).unwrap_or(0.0)
+        };
+        let canvas = match &mut self.canvas {
+            Some(c) => c,
+            None => return Err(VglError::new("渐变需要先声明 canvas", self.current_pos)),
+        };
+        match name {
+            "fill_linear_gradient" => {
+                // fill_linear_gradient(x1, y1, x2, y2, c1, c2)
+                // 沿 (x1,y1)->(x2,y2) 方向线性渐变
+                let x1 = n(0);
+                let y1 = n(1);
+                let x2 = n(2);
+                let y2 = n(3);
+                let (r1, g1, b1) = extract_color(4);
+                let (r2, g2, b2) = extract_color(5);
+                let dx = x2 - x1;
+                let dy = y2 - y1;
+                let len_sq = dx * dx + dy * dy;
+                if len_sq < 1e-10 {
+                    return Err(VglError::new("渐变起点终点重合", self.current_pos));
+                }
+                let len = len_sq.sqrt();
+                let dx = dx / len;
+                let dy = dy / len;
+                for y in 0..canvas.height {
+                    for x in 0..canvas.width {
+                        let px = x as f64;
+                        let py = y as f64;
+                        // 投影到渐变方向
+                        let t = ((px - x1) * dx + (py - y1) * dy) / len;
+                        let t = t.clamp(0.0, 1.0);
+                        let r = (r1 as f64 + (r2 - r1) as f64 * t) as f32;
+                        let g = (g1 as f64 + (g2 - g1) as f64 * t) as f32;
+                        let b = (b1 as f64 + (b2 - b1) as f64 * t) as f32;
+                        let idx = ((y * canvas.width + x) * 4) as usize;
+                        canvas.pixels[idx] = r;
+                        canvas.pixels[idx + 1] = g;
+                        canvas.pixels[idx + 2] = b;
+                        canvas.pixels[idx + 3] = 255.0;
+                    }
+                }
+            }
+            "fill_radial_gradient" => {
+                // fill_radial_gradient(cx, cy, r, c1, c2)
+                // 从中心向外径向渐变
+                let cx = n(0);
+                let cy = n(1);
+                let r = n(2);
+                let (r1, g1, b1) = extract_color(3);
+                let (r2, g2, b2) = extract_color(4);
+                if r < 1e-10 {
+                    return Err(VglError::new("渐变半径必须 > 0", self.current_pos));
+                }
+                for y in 0..canvas.height {
+                    for x in 0..canvas.width {
+                        let px = x as f64;
+                        let py = y as f64;
+                        let dist = ((px - cx) * (px - cx) + (py - cy) * (py - cy)).sqrt();
+                        let t = (dist / r).clamp(0.0, 1.0);
+                        let r_ = (r1 as f64 + (r2 - r1) as f64 * t) as f32;
+                        let g_ = (g1 as f64 + (g2 - g1) as f64 * t) as f32;
+                        let b_ = (b1 as f64 + (b2 - b1) as f64 * t) as f32;
+                        let idx = ((y * canvas.width + x) * 4) as usize;
+                        canvas.pixels[idx] = r_;
+                        canvas.pixels[idx + 1] = g_;
+                        canvas.pixels[idx + 2] = b_;
+                        canvas.pixels[idx + 3] = 255.0;
+                    }
+                }
+            }
+            _ => return Err(VglError::new(format!("未知渐变: {}", name), self.current_pos)),
+        }
+        Ok(())
+    }
+
+    /// v0.8 文本绘制（5x7 点阵字体）
+    /// text(x, y, str, size, color) — size 为缩放倍数，color 为 (r,g,b) 元组
+    fn apply_text(&mut self, args: &[Value]) -> VglResult<()> {
+        let x = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+        let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+        let s = args.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+        let size = args.get(3).and_then(|v| v.as_number()).unwrap_or(1.0) as i32;
+        let (r, g, b) = match args.get(4) {
+            Some(Value::Tuple(t)) if t.len() >= 3 => (
+                t[0].as_number().unwrap_or(0.0) as f32,
+                t[1].as_number().unwrap_or(0.0) as f32,
+                t[2].as_number().unwrap_or(0.0) as f32,
+            ),
+            Some(Value::Color(r, g, b)) => (*r as f32, *g as f32, *b as f32),
+            _ => (255.0, 255.0, 255.0),
+        };
+        let scale = size.max(1);
+        let canvas = match &mut self.canvas {
+            Some(c) => c,
+            None => return Err(VglError::new("text 需要先声明 canvas", self.current_pos)),
+        };
+        let mut cx = x;
+        for ch in s.chars() {
+            if let Some(glyph) = get_glyph(ch) {
+                // glyph 是 [[u8; 5]; 7]，7 行 5 列
+                for (row, bits) in glyph.iter().enumerate() {
+                    for (col, &on) in bits.iter().enumerate() {
+                        if on != 0 {
+                            // 绘制 scale x scale 的方块
+                            for dy in 0..scale {
+                                for dx in 0..scale {
+                                    let px = cx + (col as i32) * scale + dx;
+                                    let py = y + (row as i32) * scale + dy;
+                                    if px >= 0 && py >= 0 && px < canvas.width as i32 && py < canvas.height as i32 {
+                                        let idx = ((py as u32 * canvas.width + px as u32) * 4) as usize;
+                                        canvas.pixels[idx] = r;
+                                        canvas.pixels[idx + 1] = g;
+                                        canvas.pixels[idx + 2] = b;
+                                        canvas.pixels[idx + 3] = 255.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cx += 6 * scale; // 5 列 + 1 间距
+        }
+        Ok(())
+    }
+
     pub fn compose_layer(&mut self, name: &str, blend: &str) -> VglResult<()> {
         let layer_rc = match self.layers.get(name) {
             Some(Value::Layer(lc)) => lc.clone(),
@@ -1882,4 +2258,813 @@ impl Interpreter {
         }
         Ok(())
     }
+}
+
+// ============================================================
+// v0.8 5x7 点阵字体
+// 每个字符 7 行 x 5 列，1=点亮 0=灭
+// 支持 A-Z, a-z, 0-9, 空格及常见标点
+// ============================================================
+
+fn get_glyph(c: char) -> Option<&'static [[u8; 5]; 7]> {
+    let g: &'static [[u8; 5]; 7] = match c {
+        // ---------- 大写字母 A-Z ----------
+        'A' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'B' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        'C' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        'D' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        'E' => &[
+            [0,1,1,1,1],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,1],
+        ],
+        'F' => &[
+            [0,1,1,1,1],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+        ],
+        'G' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,0],
+            [0,1,0,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        'H' => &[
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'I' => &[
+            [0,1,1,1,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,1,1,1,0],
+        ],
+        'J' => &[
+            [0,0,1,1,1],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,1,0,1,0],
+            [0,0,1,1,0],
+        ],
+        'K' => &[
+            [0,1,0,0,1],
+            [0,1,0,1,0],
+            [0,1,1,0,0],
+            [0,1,1,0,0],
+            [0,1,0,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'L' => &[
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,1],
+        ],
+        'M' => &[
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+            [0,1,0,1,1],
+            [0,1,0,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'N' => &[
+            [0,1,0,0,1],
+            [0,1,1,0,1],
+            [0,1,1,0,1],
+            [0,1,0,1,1],
+            [0,1,0,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'O' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        'P' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+        ],
+        'Q' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,1,1],
+            [0,1,1,0,1],
+            [0,0,0,0,1],
+        ],
+        'R' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+            [0,1,0,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'S' => &[
+            [0,1,1,1,1],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,0,0,0,1],
+            [0,0,0,0,1],
+            [0,1,1,1,1],
+        ],
+        'T' => &[
+            [0,1,1,1,1],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+        ],
+        'U' => &[
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+        ],
+        'V' => &[
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+        ],
+        'W' => &[
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,1,1],
+            [0,1,0,1,1],
+            [0,1,1,1,1],
+            [0,1,0,0,1],
+        ],
+        'X' => &[
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+            [0,0,1,0,0],
+            [0,0,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'Y' => &[
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+        ],
+        'Z' => &[
+            [0,1,1,1,1],
+            [0,0,0,0,1],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,1],
+        ],
+        // ---------- 小写字母 a-z ----------
+        'a' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,0],
+            [0,0,0,0,1],
+            [0,1,1,1,1],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+        ],
+        'b' => &[
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        'c' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,1],
+        ],
+        'd' => &[
+            [0,0,0,0,1],
+            [0,0,0,0,1],
+            [0,1,1,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+        ],
+        'e' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+            [0,1,0,0,0],
+            [0,1,1,1,1],
+        ],
+        'f' => &[
+            [0,0,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+        ],
+        'g' => &[
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+            [0,0,0,0,1],
+            [0,1,1,1,0],
+        ],
+        'h' => &[
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'i' => &[
+            [0,0,1,0,0],
+            [0,0,0,0,0],
+            [0,1,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,1,1,1,0],
+        ],
+        'j' => &[
+            [0,0,0,1,0],
+            [0,0,0,0,0],
+            [0,0,1,1,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,1,0,1,0],
+            [0,0,1,1,0],
+        ],
+        'k' => &[
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,1],
+            [0,1,0,1,0],
+            [0,1,1,0,0],
+            [0,1,0,1,0],
+            [0,1,0,0,1],
+        ],
+        'l' => &[
+            [0,1,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,1,1,1,0],
+        ],
+        'm' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,0,1],
+            [0,1,0,1,1],
+            [0,1,0,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'n' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'o' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        'p' => &[
+            [0,0,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+        ],
+        'q' => &[
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+            [0,0,0,0,1],
+            [0,0,0,0,1],
+        ],
+        'r' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+            [0,1,0,0,1],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+        ],
+        's' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,0,0,0,1],
+            [0,1,1,1,0],
+        ],
+        't' => &[
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+        ],
+        'u' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,1,1],
+            [0,0,1,0,1],
+        ],
+        'v' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+        ],
+        'w' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,1,1],
+            [0,1,0,1,1],
+            [0,0,1,0,1],
+        ],
+        'x' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+        ],
+        'y' => &[
+            [0,0,0,0,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,0,1,1,1],
+            [0,0,0,0,1],
+            [0,1,1,1,0],
+        ],
+        'z' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,1],
+        ],
+        // ---------- 数字 0-9 ----------
+        '0' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,0,1,1],
+            [0,1,1,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        '1' => &[
+            [0,0,1,0,0],
+            [0,1,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,1,1,1,0],
+        ],
+        '2' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,0,0,0,1],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,1],
+        ],
+        '3' => &[
+            [0,1,1,1,1],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,0,0,1,0],
+            [0,0,0,0,1],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+        ],
+        '4' => &[
+            [0,0,0,1,0],
+            [0,0,1,1,0],
+            [0,1,0,1,0],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+        ],
+        '5' => &[
+            [0,1,1,1,1],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,0,0,0,1],
+            [0,0,0,0,1],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+        ],
+        '6' => &[
+            [0,0,1,1,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+        ],
+        '7' => &[
+            [0,1,1,1,1],
+            [0,0,0,0,1],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+        ],
+        '8' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        '9' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,0,1],
+            [0,1,1,1,1],
+            [0,0,0,0,1],
+            [0,0,0,1,0],
+            [0,1,1,0,0],
+        ],
+        // ---------- 标点符号 ----------
+        ' ' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+        ],
+        '.' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+        ],
+        ',' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+        ],
+        '!' => &[
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,0,0,0],
+            [0,0,1,0,0],
+        ],
+        '?' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,0,0,0,1],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,0,0,0,0],
+            [0,0,1,0,0],
+        ],
+        ':' => &[
+            [0,0,0,0,0],
+            [0,0,1,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,1,0,0],
+            [0,0,0,0,0],
+        ],
+        ';' => &[
+            [0,0,0,0,0],
+            [0,0,1,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+        ],
+        '-' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+        ],
+        '+' => &[
+            [0,0,0,0,0],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,1,1,1,1],
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,0,0,0],
+        ],
+        '/' => &[
+            [0,0,0,0,1],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+        ],
+        '(' => &[
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,0,1,0,0],
+            [0,0,0,1,0],
+        ],
+        ')' => &[
+            [0,1,0,0,0],
+            [0,0,1,0,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+        ],
+        '=' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+        ],
+        '*' => &[
+            [0,0,0,0,0],
+            [0,1,0,0,1],
+            [0,0,1,1,0],
+            [0,0,1,0,0],
+            [0,0,1,1,0],
+            [0,1,0,0,1],
+            [0,0,0,0,0],
+        ],
+        '#' => &[
+            [0,1,0,1,0],
+            [0,1,0,1,0],
+            [0,1,1,1,1],
+            [0,1,0,1,0],
+            [0,1,1,1,1],
+            [0,1,0,1,0],
+            [0,1,0,1,0],
+        ],
+        '@' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,1],
+            [0,1,0,1,1],
+            [0,1,0,1,1],
+            [0,1,0,1,1],
+            [0,1,0,0,0],
+            [0,0,1,1,0],
+        ],
+        '\'' => &[
+            [0,0,1,0,0],
+            [0,0,1,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+        ],
+        '"' => &[
+            [0,1,0,1,0],
+            [0,1,0,1,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+        ],
+        '<' => &[
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,0,1,0,0],
+            [0,0,0,1,0],
+        ],
+        '>' => &[
+            [0,1,0,0,0],
+            [0,0,1,0,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+        ],
+        '[' => &[
+            [0,1,1,1,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+        ],
+        ']' => &[
+            [0,1,1,1,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,0,0,1,0],
+            [0,1,1,1,0],
+        ],
+        '_' => &[
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,0,0,0,0],
+            [0,1,1,1,1],
+        ],
+        '%' => &[
+            [0,1,1,0,1],
+            [0,1,1,1,0],
+            [0,0,0,1,0],
+            [0,0,1,0,0],
+            [0,1,0,0,0],
+            [0,1,1,1,0],
+            [0,1,0,1,1],
+        ],
+        '&' => &[
+            [0,1,1,0,0],
+            [0,1,0,1,0],
+            [0,1,0,1,0],
+            [0,1,1,0,0],
+            [0,1,0,1,0],
+            [0,1,0,0,1],
+            [0,1,1,1,0],
+        ],
+        '$' => &[
+            [0,0,1,0,0],
+            [0,1,1,1,1],
+            [0,1,0,1,0],
+            [0,1,1,1,0],
+            [0,0,1,0,1],
+            [0,1,1,1,1],
+            [0,0,1,0,0],
+        ],
+        _ => return None,
+    };
+    Some(g)
 }

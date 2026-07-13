@@ -1,5 +1,6 @@
 // ============================================================
-// 绘图引擎
+// 绘图引擎 v0.8 — 高质量 2D 渲染
+// 改进：SDF 抗锯齿、premultiply 合成、子像素精度、sRGB 预留
 // ============================================================
 
 #[derive(Clone, Debug)]
@@ -25,10 +26,9 @@ impl Canvas {
         self.put_pixel_rgba(x, y, r, g, b, 255.0)
     }
 
-    /// 写入带 alpha 的像素，与现有像素做 source-over 合成
+    /// 写入带 alpha 的像素，与现有像素做 source-over 合成（premultiply 方式）
     /// src=新像素，dst=现有像素
-    /// out_alpha = src_a + dst_a * (1 - src_a) / 255
-    /// out_rgb = (src_rgb * src_a + dst_rgb * dst_a * (1 - src_a/255)) / out_alpha
+    /// v0.8：使用 premultiply 合成，修复 out_a=0 时输出非零的边界 bug
     pub fn put_pixel_rgba(&mut self, x: i32, y: i32, r: f32, g: f32, b: f32, a: f32) {
         if x < 0 || x >= self.width as i32 || y < 0 || y >= self.height as i32 {
             return;
@@ -41,15 +41,26 @@ impl Canvas {
         let da = self.pixels[idx + 3] / 255.0;
         let out_a = sa + da * (1.0 - sa);
         if out_a <= 0.0 {
-            self.pixels[idx..idx + 4].copy_from_slice(&[r, g, b, a]);
+            // 完全透明，输出全零（修复旧版写入 src 颜色的 bug）
+            self.pixels[idx] = 0.0;
+            self.pixels[idx + 1] = 0.0;
+            self.pixels[idx + 2] = 0.0;
+            self.pixels[idx + 3] = 0.0;
             return;
         }
-        let r2 = (r * sa + self.pixels[idx] * da * (1.0 - sa)) / out_a;
-        let g2 = (g * sa + self.pixels[idx + 1] * da * (1.0 - sa)) / out_a;
-        let b2 = (b * sa + self.pixels[idx + 2] * da * (1.0 - sa)) / out_a;
-        self.pixels[idx] = r2.max(0.0).min(255.0);
-        self.pixels[idx + 1] = g2.max(0.0).min(255.0);
-        self.pixels[idx + 2] = b2.max(0.0).min(255.0);
+        // premultiply 合成：src/dst 先乘以各自 alpha，再线性混合，最后除以 out_a 还原
+        let src_r = r * sa;
+        let src_g = g * sa;
+        let src_b = b * sa;
+        let dst_r = self.pixels[idx] * da;
+        let dst_g = self.pixels[idx + 1] * da;
+        let dst_b = self.pixels[idx + 2] * da;
+        let out_r = (src_r + dst_r * (1.0 - sa)) / out_a;
+        let out_g = (src_g + dst_g * (1.0 - sa)) / out_a;
+        let out_b = (src_b + dst_b * (1.0 - sa)) / out_a;
+        self.pixels[idx] = out_r.max(0.0).min(255.0);
+        self.pixels[idx + 1] = out_g.max(0.0).min(255.0);
+        self.pixels[idx + 2] = out_b.max(0.0).min(255.0);
         self.pixels[idx + 3] = out_a * 255.0;
     }
 
@@ -58,15 +69,18 @@ impl Canvas {
         self.put_pixel_rgba(x, y, r, g, b, (alpha.max(0.0).min(1.0) * 255.0) as f32);
     }
 
+    /// 画线（width<=1 走 Wu AA 细线，width>1 走 SDF 粗线）
+    /// v0.8：粗线改为 SDF 距离场方法，自带圆头 cap，消除段间缝隙
     pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, width: f64, r: f32, g: f32, b: f32) {
         if width <= 1.0 {
             self.wu_line(x0, y0, x1, y1, r, g, b);
         } else {
-            for (x, y) in self.bresenham_points(x0, y0, x1, y1) {
-                self.brush(x, y, width as i32, r, g, b);
-            }
+            self.draw_thick_line_aa(x0 as f64, y0 as f64, x1 as f64, y1 as f64, width, r, g, b);
         }
     }
+
+    /// Bresenham 整数点列（保留公开 API，供外部使用）
+    #[allow(dead_code)]
     pub fn bresenham_points(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
         let mut pts = Vec::new();
         let dx = (x1 - x0).abs();
@@ -93,18 +107,82 @@ impl Canvas {
         }
         pts
     }
+
+    /// v0.8：SDF 距离场 AA 圆形笔刷
+    /// 对覆盖像素计算到圆心距离 d：
+    ///   d <= rad-1：完全不透明
+    ///   rad-1 < d < rad+1：alpha = rad+1-d（线性过渡，2px AA 带）
+    ///   d >= rad+1：不绘制
+    #[allow(dead_code)]
     pub fn brush(&mut self, cx: i32, cy: i32, radius: i32, r: f32, g: f32, b: f32) {
-        let rad = radius as f64 / 2.0;
-        let r2 = rad * rad;
-        let ri = (rad + 1.0) as i32;
+        if radius <= 0 {
+            return;
+        }
+        let rad = radius as f64 / 2.0; // 实际圆半径（radius 是直径语义）
+        let outer = rad + 1.0;
+        let ri = outer.ceil() as i32;
         for dy in -ri..=ri {
             for dx in -ri..=ri {
-                if (dx * dx + dy * dy) as f64 <= r2 {
-                    self.put_pixel(cx + dx, cy + dy, r, g, b);
+                let d = ((dx * dx + dy * dy) as f64).sqrt();
+                let alpha = if d <= rad - 1.0 {
+                    1.0
+                } else if d <= rad + 1.0 {
+                    rad + 1.0 - d
+                } else {
+                    continue;
+                };
+                if alpha <= 0.0 {
+                    continue;
+                }
+                self.put_pixel_aa(cx + dx, cy + dy, r, g, b, alpha);
+            }
+        }
+    }
+
+    /// v0.8：SDF 粗线 AA（内部辅助，直接计算每像素到线段距离）
+    /// 相比 stamp 笔刷，无重叠合成导致的 AA 退化，且自带圆头 cap
+    fn draw_thick_line_aa(
+        &mut self,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        width: f64,
+        r: f32,
+        g: f32,
+        b: f32,
+    ) {
+        let half_w = width / 2.0;
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len_sq = dx * dx + dy * dy;
+        // 包围盒（外扩 half_w + 1px 供 AA）
+        let min_x = (x0.min(x1) - half_w - 1.0).floor() as i32;
+        let max_x = (x0.max(x1) + half_w + 1.0).ceil() as i32;
+        let min_y = (y0.min(y1) - half_w - 1.0).floor() as i32;
+        let max_y = (y0.max(y1) + half_w + 1.0).ceil() as i32;
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let pxf = px as f64;
+                let pyf = py as f64;
+                // 点到线段最近点参数 t（clamped → 圆头 cap）
+                let t = if len_sq > 0.0 {
+                    (((pxf - x0) * dx + (pyf - y0) * dy) / len_sq).max(0.0).min(1.0)
+                } else {
+                    0.0
+                };
+                let cx = x0 + t * dx;
+                let cy = y0 + t * dy;
+                let dist = ((pxf - cx) * (pxf - cx) + (pyf - cy) * (pyf - cy)).sqrt();
+                let alpha = (half_w + 0.5 - dist).max(0.0).min(1.0);
+                if alpha > 0.0 {
+                    self.put_pixel_aa(px, py, r, g, b, alpha);
                 }
             }
         }
     }
+
+    /// Wu 抗锯齿细线（width<=1 时使用）
     pub fn wu_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, r: f32, g: f32, b: f32) {
         fn ipart(x: f64) -> i32 { x.floor() as i32 }
         fn fpart(x: f64) -> f64 { x - x.floor() }
@@ -158,37 +236,30 @@ impl Canvas {
             intery += grad;
         }
     }
+
+    /// v0.8：SDF 距离场 AA 圆轮廓
+    /// 对轮廓附近像素计算到圆周距离 dist=|d-radius|
+    /// alpha = clamp(width/2 + 0.5 - dist, 0, 1)，给出宽度自适应的 AA 边缘
     pub fn draw_circle(&mut self, cx: i32, cy: i32, radius: i32, width: f64, r: f32, g: f32, b: f32) {
-        let mut x = radius;
-        let mut y = 0;
-        let mut err = 0;
-        while x >= y {
-            for (px, py) in &[
-                (cx + x, cy + y),
-                (cx + y, cy + x),
-                (cx - y, cy + x),
-                (cx - x, cy + y),
-                (cx - x, cy - y),
-                (cx - y, cy - x),
-                (cx + y, cy - x),
-                (cx + x, cy - y),
-            ] {
-                if width <= 1.0 {
-                    self.put_pixel(*px, *py, r, g, b);
-                } else {
-                    self.brush(*px, *py, width as i32, r, g, b);
+        if radius <= 0 || width <= 0.0 {
+            return;
+        }
+        let cr = radius as f64;
+        let half_w = width / 2.0;
+        let r_outer = cr + half_w + 1.0;
+        let r_hi = r_outer.ceil() as i32;
+        for dy in -r_hi..=r_hi {
+            for dx in -r_hi..=r_hi {
+                let d = ((dx * dx + dy * dy) as f64).sqrt();
+                let dist = (d - cr).abs();
+                let alpha = (half_w + 0.5 - dist).max(0.0).min(1.0);
+                if alpha > 0.0 {
+                    self.put_pixel_aa(cx + dx, cy + dy, r, g, b, alpha);
                 }
-            }
-            y += 1;
-            if err <= 0 {
-                err += 2 * y + 1;
-            }
-            if err > 0 {
-                x -= 1;
-                err -= 2 * x + 1;
             }
         }
     }
+
     pub fn sample_bezier3(
         &self,
         p1: (f64, f64),
@@ -210,6 +281,7 @@ impl Canvas {
         }
         pts
     }
+
     /// 二次贝塞尔采样（通过提升为三次）
     pub fn sample_bezier2(
         &self,
@@ -223,6 +295,7 @@ impl Canvas {
         let c2 = (p3.0 + (p2.0 - p3.0) * 2.0 / 3.0, p3.1 + (p2.1 - p3.1) * 2.0 / 3.0);
         self.sample_bezier3(p1, c1, c2, p3, n)
     }
+
     pub fn fill(&mut self, r: f32, g: f32, b: f32) {
         for i in (0..self.pixels.len()).step_by(4) {
             self.pixels[i] = r;
@@ -234,7 +307,7 @@ impl Canvas {
 
     // v0.75 新增绘图原语
 
-    /// 矩形填充
+    /// 矩形填充（v0.8：改为 source-over 合成）
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, r: f32, g: f32, b: f32) {
         let x_end = (x + w).min(self.width as i32);
         let y_end = (y + h).min(self.height as i32);
@@ -242,80 +315,108 @@ impl Canvas {
         let y_start = y.max(0);
         for yy in y_start..y_end {
             for xx in x_start..x_end {
-                let idx = ((yy as u32 * self.width + xx as u32) * 4) as usize;
-                self.pixels[idx] = r;
-                self.pixels[idx + 1] = g;
-                self.pixels[idx + 2] = b;
-                self.pixels[idx + 3] = 255.0;
+                self.put_pixel_rgba(xx, yy, r, g, b, 255.0);
             }
         }
     }
 
-    /// 圆形填充（使用中点圆算法的填充版本）
+    /// 圆形填充（v0.8：SDF 边缘 AA + source-over 合成）
     pub fn fill_circle(&mut self, cx: i32, cy: i32, radius: i32, r: f32, g: f32, b: f32) {
-        if radius <= 0 { return; }
-        for dy in -radius..=radius {
+        if radius <= 0 {
+            return;
+        }
+        let cr = radius as f64;
+        let ri = (cr + 1.0).ceil() as i32;
+        for dy in -ri..=ri {
             let yy = cy + dy;
-            if yy < 0 || yy >= self.height as i32 { continue; }
-            let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
-            for dx in -dx_max..=dx_max {
+            if yy < 0 || yy >= self.height as i32 {
+                continue;
+            }
+            for dx in -ri..=ri {
                 let xx = cx + dx;
-                if xx < 0 || xx >= self.width as i32 { continue; }
-                let idx = ((yy as u32 * self.width + xx as u32) * 4) as usize;
-                self.pixels[idx] = r;
-                self.pixels[idx + 1] = g;
-                self.pixels[idx + 2] = b;
-                self.pixels[idx + 3] = 255.0;
+                if xx < 0 || xx >= self.width as i32 {
+                    continue;
+                }
+                let d = ((dx * dx + dy * dy) as f64).sqrt();
+                // 边缘 AA：d in [cr-0.5, cr+0.5] 线性过渡
+                let alpha = (cr + 0.5 - d).max(0.0).min(1.0);
+                if alpha > 0.0 {
+                    self.put_pixel_rgba(xx, yy, r, g, b, (alpha * 255.0) as f32);
+                }
             }
         }
     }
 
-    /// 椭圆填充
+    /// 椭圆填充（v0.8：归一化距离边缘 AA + source-over 合成）
     pub fn fill_ellipse(&mut self, cx: i32, cy: i32, rx: i32, ry: i32, r: f32, g: f32, b: f32) {
-        if rx <= 0 || ry <= 0 { return; }
-        for dy in -ry..=ry {
+        if rx <= 0 || ry <= 0 {
+            return;
+        }
+        let rxf = rx as f64;
+        let ryf = ry as f64;
+        let rxi = rx + 1;
+        let ryi = ry + 1;
+        // AA 带宽度（归一化空间），保证实际约 0.5px
+        let aa_width = 0.5 / rxf.min(ryf);
+        for dy in -ryi..=ryi {
             let yy = cy + dy;
-            if yy < 0 || yy >= self.height as i32 { continue; }
-            let dx_max = ((rx as f64 * rx as f64 * (1.0 - (dy * dy) as f64 / (ry * ry) as f64))).sqrt() as i32;
-            for dx in -dx_max..=dx_max {
+            if yy < 0 || yy >= self.height as i32 {
+                continue;
+            }
+            for dx in -rxi..=rxi {
                 let xx = cx + dx;
-                if xx < 0 || xx >= self.width as i32 { continue; }
-                let idx = ((yy as u32 * self.width + xx as u32) * 4) as usize;
-                self.pixels[idx] = r;
-                self.pixels[idx + 1] = g;
-                self.pixels[idx + 2] = b;
-                self.pixels[idx + 3] = 255.0;
+                if xx < 0 || xx >= self.width as i32 {
+                    continue;
+                }
+                let dxf = dx as f64;
+                let dyf = dy as f64;
+                let d_norm = ((dxf * dxf) / (rxf * rxf) + (dyf * dyf) / (ryf * ryf)).sqrt();
+                // d_norm=1 在椭圆上，<1 在内部；alpha 在归一化 AA 带内过渡
+                let alpha = ((1.0 - d_norm) / aa_width + 0.5).max(0.0).min(1.0);
+                if alpha > 0.0 {
+                    self.put_pixel_rgba(xx, yy, r, g, b, (alpha * 255.0) as f32);
+                }
             }
         }
     }
 
-    /// 多边形填充（扫描线算法）
+    /// 多边形填充（v0.8：子像素精度扫描线 + source-over 合成）
+    /// 扫描线取像素中心 y+0.5，边界像素按覆盖率计算 alpha
     pub fn fill_polygon(&mut self, pts: &[(i32, i32)], r: f32, g: f32, b: f32) {
-        if pts.len() < 3 { return; }
+        if pts.len() < 3 {
+            return;
+        }
         let y_min = pts.iter().map(|p| p.1).min().unwrap_or(0).max(0);
         let y_max = pts.iter().map(|p| p.1).max().unwrap_or(0).min(self.height as i32 - 1);
+        let n = pts.len();
         for y in y_min..=y_max {
+            let y_scan = y as f64 + 0.5; // 像素中心
             let mut intersections = Vec::new();
-            let n = pts.len();
             for i in 0..n {
                 let (x1, y1) = pts[i];
                 let (x2, y2) = pts[(i + 1) % n];
-                if (y1 <= y && y2 > y) || (y2 <= y && y1 > y) {
-                    let t = (y - y1) as f64 / (y2 - y1) as f64;
+                let y1f = y1 as f64;
+                let y2f = y2 as f64;
+                if (y1f <= y_scan && y2f > y_scan) || (y2f <= y_scan && y1f > y_scan) {
+                    let t = (y_scan - y1f) / (y2f - y1f);
                     intersections.push(x1 as f64 + t * (x2 - x1) as f64);
                 }
             }
             intersections.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let mut i = 0;
             while i + 1 < intersections.len() {
-                let x_start = intersections[i].ceil() as i32;
-                let x_end = intersections[i + 1].floor() as i32;
+                let x_left = intersections[i];
+                let x_right = intersections[i + 1];
+                // 像素 x 覆盖范围 [x, x+1] 与 span [x_left, x_right] 求交集
+                let x_start = x_left.floor() as i32;
+                let x_end = x_right.ceil() as i32;
                 for x in x_start.max(0)..=x_end.min(self.width as i32 - 1) {
-                    let idx = ((y as u32 * self.width + x as u32) * 4) as usize;
-                    self.pixels[idx] = r;
-                    self.pixels[idx + 1] = g;
-                    self.pixels[idx + 2] = b;
-                    self.pixels[idx + 3] = 255.0;
+                    let px_left = x as f64;
+                    let px_right = x as f64 + 1.0;
+                    let cov = (px_right.min(x_right) - px_left.max(x_left)).max(0.0).min(1.0);
+                    if cov > 0.0 {
+                        self.put_pixel_rgba(x, y, r, g, b, (cov * 255.0) as f32);
+                    }
                 }
                 i += 2;
             }
@@ -324,7 +425,9 @@ impl Canvas {
 
     /// 泛洪填充（从种子点开始，将相似颜色区域替换为新颜色）
     pub fn flood_fill(&mut self, x: i32, y: i32, r: f32, g: f32, b: f32) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 { return; }
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
         let start_idx = ((y as u32 * self.width + x as u32) * 4) as usize;
         let target_r = self.pixels[start_idx];
         let target_g = self.pixels[start_idx + 1];
@@ -337,13 +440,17 @@ impl Canvas {
         let w = self.width as i32;
         let h = self.height as i32;
         while let Some((cx, cy)) = stack.pop() {
-            if cx < 0 || cy < 0 || cx >= w || cy >= h { continue; }
+            if cx < 0 || cy < 0 || cx >= w || cy >= h {
+                continue;
+            }
             let idx = ((cy as u32 * self.width + cx as u32) * 4) as usize;
             // 颜色匹配（容差 2.0）
             if (self.pixels[idx] - target_r).abs() > 2.0
                 || (self.pixels[idx + 1] - target_g).abs() > 2.0
                 || (self.pixels[idx + 2] - target_b).abs() > 2.0
-            { continue; }
+            {
+                continue;
+            }
             self.pixels[idx] = r;
             self.pixels[idx + 1] = g;
             self.pixels[idx + 2] = b;
@@ -355,40 +462,58 @@ impl Canvas {
         }
     }
 
-    /// 椭圆轮廓绘制
+    /// 椭圆轮廓绘制（v0.8：f64 采样 + SDF AA draw_line，圆头 cap 消除缝隙）
     pub fn draw_ellipse(&mut self, cx: i32, cy: i32, rx: i32, ry: i32, width: f64, r: f32, g: f32, b: f32) {
-        if rx <= 0 || ry <= 0 { return; }
-        // 用参数方程采样点，然后连线
+        if rx <= 0 || ry <= 0 {
+            return;
+        }
+        let cxf = cx as f64;
+        let cyf = cy as f64;
+        let rxf = rx as f64;
+        let ryf = ry as f64;
         let steps = ((rx + ry) as f64 * 0.5 * std::f64::consts::PI).max(16.0) as usize;
-        let mut prev: Option<(i32, i32)> = None;
+        let mut prev: Option<(f64, f64)> = None;
         for i in 0..=steps {
             let t = i as f64 / steps as f64 * std::f64::consts::PI * 2.0;
-            let x = cx + (t.cos() * rx as f64).round() as i32;
-            let y = cy + (t.sin() * ry as f64).round() as i32;
+            let x = cxf + t.cos() * rxf;
+            let y = cyf + t.sin() * ryf;
             if let Some((px, py)) = prev {
-                self.draw_line(px, py, x, y, width, r, g, b);
+                if width <= 1.0 {
+                    self.wu_line(px.round() as i32, py.round() as i32, x.round() as i32, y.round() as i32, r, g, b);
+                } else {
+                    self.draw_thick_line_aa(px, py, x, y, width, r, g, b);
+                }
             }
             prev = Some((x, y));
         }
     }
 
-    /// 弧线绘制（从 start_angle 到 end_angle，弧度制）
+    /// 弧线绘制（v0.8：f64 采样 + SDF AA draw_line，圆头 cap 消除缝隙）
     pub fn draw_arc(&mut self, cx: i32, cy: i32, radius: i32, start: f64, end: f64, width: f64, r: f32, g: f32, b: f32) {
-        if radius <= 0 { return; }
-        let steps = ((end - start) * radius as f64).max(8.0) as usize;
-        let mut prev: Option<(i32, i32)> = None;
+        if radius <= 0 {
+            return;
+        }
+        let cxf = cx as f64;
+        let cyf = cy as f64;
+        let radf = radius as f64;
+        let steps = ((end - start).abs() * radf).max(8.0) as usize;
+        let mut prev: Option<(f64, f64)> = None;
         for i in 0..=steps {
             let t = start + (end - start) * (i as f64 / steps as f64);
-            let x = cx + (t.cos() * radius as f64).round() as i32;
-            let y = cy + (t.sin() * radius as f64).round() as i32;
+            let x = cxf + t.cos() * radf;
+            let y = cyf + t.sin() * radf;
             if let Some((px, py)) = prev {
-                self.draw_line(px, py, x, y, width, r, g, b);
+                if width <= 1.0 {
+                    self.wu_line(px.round() as i32, py.round() as i32, x.round() as i32, y.round() as i32, r, g, b);
+                } else {
+                    self.draw_thick_line_aa(px, py, x, y, width, r, g, b);
+                }
             }
             prev = Some((x, y));
         }
     }
 
-    /// 矩形轮廓绘制
+    /// 矩形轮廓绘制（使用 AA draw_line）
     pub fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, width: f64, r: f32, g: f32, b: f32) {
         let x2 = x + w;
         let y2 = y + h;
@@ -396,6 +521,24 @@ impl Canvas {
         self.draw_line(x2, y, x2, y2, width, r, g, b);
         self.draw_line(x2, y2, x, y2, width, r, g, b);
         self.draw_line(x, y2, x, y, width, r, g, b);
+    }
+
+    /// v0.8：AA 折线（备用，interp.rs 暂未调用）
+    /// 在每个连接点利用 SDF 粗线的圆头 cap 自动消除缝隙
+    #[allow(dead_code)]
+    pub fn draw_polyline_aa(&mut self, points: &[(f64, f64)], width: f64, r: f32, g: f32, b: f32) {
+        if points.len() < 2 {
+            return;
+        }
+        for i in 0..points.len() - 1 {
+            let (x0, y0) = points[i];
+            let (x1, y1) = points[i + 1];
+            if width <= 1.0 {
+                self.wu_line(x0.round() as i32, y0.round() as i32, x1.round() as i32, y1.round() as i32, r, g, b);
+            } else {
+                self.draw_thick_line_aa(x0, y0, x1, y1, width, r, g, b);
+            }
+        }
     }
 }
 
@@ -432,6 +575,7 @@ impl Canvas {
     }
 
     /// 带材质的 put_pixel
+    #[allow(dead_code)]
     pub fn put_pixel_mat(&mut self, x: i32, y: i32, m: &MaterialParams) {
         if x < 0 || x >= self.width as i32 || y < 0 || y >= self.height as i32 {
             return;
@@ -440,7 +584,7 @@ impl Canvas {
         self.put_pixel_rgba(x, y, r, g, b, a);
     }
 
-    /// 带材质的抗锯齿 put_pixel（alpha 由 Wu 算法计算，材质 alpha 相乘）
+    /// 带材质的抗锯齿 put_pixel（alpha 由 Wu/SDF 算法计算，材质 alpha 相乘）
     pub fn put_pixel_aa_mat(&mut self, x: i32, y: i32, m: &MaterialParams, aa_alpha: f64) {
         if aa_alpha <= 0.0 || x < 0 || x >= self.width as i32 || y < 0 || y >= self.height as i32 {
             return;
@@ -450,15 +594,66 @@ impl Canvas {
         self.put_pixel_rgba(x, y, r, g, b, (combined * 255.0) as f32);
     }
 
-    /// 带材质的 brush（圆形笔刷）
+    /// v0.8：带材质的 SDF AA 圆形笔刷
+    #[allow(dead_code)]
     pub fn brush_mat(&mut self, cx: i32, cy: i32, radius: i32, m: &MaterialParams) {
+        if radius <= 0 {
+            return;
+        }
         let rad = radius as f64 / 2.0;
-        let r2 = rad * rad;
-        let ri = (rad + 1.0) as i32;
+        let outer = rad + 1.0;
+        let ri = outer.ceil() as i32;
         for dy in -ri..=ri {
             for dx in -ri..=ri {
-                if (dx * dx + dy * dy) as f64 <= r2 {
-                    self.put_pixel_mat(cx + dx, cy + dy, m);
+                let d = ((dx * dx + dy * dy) as f64).sqrt();
+                let alpha = if d <= rad - 1.0 {
+                    1.0
+                } else if d <= rad + 1.0 {
+                    rad + 1.0 - d
+                } else {
+                    continue;
+                };
+                if alpha <= 0.0 {
+                    continue;
+                }
+                self.put_pixel_aa_mat(cx + dx, cy + dy, m, alpha);
+            }
+        }
+    }
+
+    /// v0.8：带材质的 SDF 粗线 AA（内部辅助）
+    fn draw_thick_line_aa_mat(
+        &mut self,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        width: f64,
+        m: &MaterialParams,
+    ) {
+        let half_w = width / 2.0;
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len_sq = dx * dx + dy * dy;
+        let min_x = (x0.min(x1) - half_w - 1.0).floor() as i32;
+        let max_x = (x0.max(x1) + half_w + 1.0).ceil() as i32;
+        let min_y = (y0.min(y1) - half_w - 1.0).floor() as i32;
+        let max_y = (y0.max(y1) + half_w + 1.0).ceil() as i32;
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let pxf = px as f64;
+                let pyf = py as f64;
+                let t = if len_sq > 0.0 {
+                    (((pxf - x0) * dx + (pyf - y0) * dy) / len_sq).max(0.0).min(1.0)
+                } else {
+                    0.0
+                };
+                let cx = x0 + t * dx;
+                let cy = y0 + t * dy;
+                let dist = ((pxf - cx) * (pxf - cx) + (pyf - cy) * (pyf - cy)).sqrt();
+                let alpha = (half_w + 0.5 - dist).max(0.0).min(1.0);
+                if alpha > 0.0 {
+                    self.put_pixel_aa_mat(px, py, m, alpha);
                 }
             }
         }
@@ -525,7 +720,7 @@ impl Canvas {
         }
     }
 
-    /// 带材质的 draw_line
+    /// v0.8：带材质的 draw_line（粗线走 SDF，细线走 Wu）
     pub fn draw_line_mat(
         &mut self,
         x0: i32,
@@ -538,13 +733,11 @@ impl Canvas {
         if width <= 1.0 {
             self.wu_line_mat(x0, y0, x1, y1, m);
         } else {
-            for (x, y) in self.bresenham_points(x0, y0, x1, y1) {
-                self.brush_mat(x, y, width as i32, m);
-            }
+            self.draw_thick_line_aa_mat(x0 as f64, y0 as f64, x1 as f64, y1 as f64, width, m);
         }
     }
 
-    /// 带材质的 draw_circle
+    /// v0.8：带材质的 SDF AA 圆轮廓
     pub fn draw_circle_mat(
         &mut self,
         cx: i32,
@@ -553,34 +746,34 @@ impl Canvas {
         width: f64,
         m: &MaterialParams,
     ) {
-        let mut x = radius;
-        let mut y = 0;
-        let mut err = 0;
-        while x >= y {
-            for (px, py) in &[
-                (cx + x, cy + y),
-                (cx + y, cy + x),
-                (cx - y, cy + x),
-                (cx - x, cy + y),
-                (cx - x, cy - y),
-                (cx - y, cy - x),
-                (cx + y, cy - x),
-                (cx + x, cy - y),
-            ] {
-                if width <= 1.0 {
-                    self.put_pixel_mat(*px, *py, m);
-                } else {
-                    self.brush_mat(*px, *py, width as i32, m);
+        if radius <= 0 || width <= 0.0 {
+            return;
+        }
+        let cr = radius as f64;
+        let half_w = width / 2.0;
+        let r_outer = cr + half_w + 1.0;
+        let r_hi = r_outer.ceil() as i32;
+        for dy in -r_hi..=r_hi {
+            for dx in -r_hi..=r_hi {
+                let d = ((dx * dx + dy * dy) as f64).sqrt();
+                let dist = (d - cr).abs();
+                let alpha = (half_w + 0.5 - dist).max(0.0).min(1.0);
+                if alpha > 0.0 {
+                    self.put_pixel_aa_mat(cx + dx, cy + dy, m, alpha);
                 }
-            }
-            y += 1;
-            if err <= 0 {
-                err += 2 * y + 1;
-            }
-            if err > 0 {
-                x -= 1;
-                err -= 2 * x + 1;
             }
         }
     }
+}
+
+/// v0.8 预留：sRGB 伽马编码（线性→sRGB），暂未集成到渲染管线
+#[allow(dead_code)]
+pub fn to_srgb(linear: f32) -> u8 {
+    let c = linear / 255.0;
+    let srgb = if c <= 0.0031308 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb * 255.0).clamp(0.0, 255.0) as u8
 }
