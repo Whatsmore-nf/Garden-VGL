@@ -1,0 +1,37 @@
+// v0.7 标准库扩展演示
+// 测试数学函数、颜色函数、后处理、混合模式
+
+canvas 400x400
+bg #101020
+
+// 数学函数：lerp + smoothstep 生成渐变
+let cx = 200
+let cy = 200
+
+// 颜色函数：hsl_to_rgb 绘制色环
+for i in 0..360 {
+    let angle = i * 2
+    let rad = radians(angle)
+    let r = 150
+    let x = cx + int(cos(rad) * r)
+    let y = cy + int(sin(rad) * r)
+    let hue = i
+    let col = hsl_to_rgb(hue, 1.0, 0.5)
+    pixel(x: x, y: y, rgb: col)
+}
+
+// lerp_color 测试
+for i in 0..50 {
+    let t = i / 50.0
+    let c = lerp_color((255, 0, 0), (0, 0, 255), t)
+    pixel(x: 50 + i, y: 380, rgb: c)
+    pixel(x: 50 + i, y: 381, rgb: c)
+}
+
+// 后处理：vignette
+vignette(0.4, 0.5)
+
+// 后处理：轻微 grain
+grain(0.03)
+
+render "v07_demo.png"

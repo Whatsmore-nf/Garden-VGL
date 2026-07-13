@@ -1,4 +1,4 @@
-// VGL 解释器 — Rust 版（v0.6 完整实现）
+// VGL 解释器 — Rust 版（v0.7 完整实现）
 // 对应规范: VGL_语法规范 v0.5.txt（v0.6 修订）
 // 用法:
 //   vgl [--continue-on-error] <file.vgl>

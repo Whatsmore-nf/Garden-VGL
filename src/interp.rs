@@ -288,6 +288,15 @@ impl Interpreter {
             self.fill_field(&field_name, env)?;
             return Ok(Value::None);
         }
+        // v0.7 后处理函数（需要 self.canvas）
+        if matches!(name, "grain" | "vignette" | "blur" | "sharpen") {
+            let mut arg_vals = Vec::new();
+            for a in args {
+                arg_vals.push(self.eval(a, env.clone())?);
+            }
+            self.apply_postprocess(name, &arg_vals)?;
+            return Ok(Value::None);
+        }
         // struct 构造
         if self.struct_defs.contains_key(name) {
             return self.construct_struct(name, args, kwargs, env);
@@ -348,6 +357,143 @@ impl Interpreter {
             "pow" => Value::Number(num!(0).powf(num!(1))),
             "min" => Value::Number(num!(0).min(num!(1))),
             "max" => Value::Number(num!(0).max(num!(1))),
+            // v0.7 数学函数扩展
+            "tan" => Value::Number(num!(0).tan()),
+            "asin" => Value::Number(num!(0).asin()),
+            "acos" => Value::Number(num!(0).acos()),
+            "atan" => Value::Number(num!(0).atan()),
+            "atan2" => Value::Number(num!(0).atan2(num!(1))),
+            "log" => Value::Number(num!(0).ln()),
+            "log2" => Value::Number(num!(0).log2()),
+            "log10" => Value::Number(num!(0).log10()),
+            "exp" => Value::Number(num!(0).exp()),
+            "round" => Value::Number(num!(0).round()),
+            "sign" => Value::Number(num!(0).signum()),
+            "clamp" => {
+                let x = num!(0);
+                let lo = num!(1);
+                let hi = num!(2);
+                Value::Number(x.max(lo).min(hi))
+            }
+            "lerp" => {
+                let a = num!(0);
+                let b = num!(1);
+                let t = num!(2);
+                Value::Number(a + (b - a) * t)
+            }
+            "smoothstep" => {
+                let e0 = num!(0);
+                let e1 = num!(1);
+                let x = num!(2);
+                let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+                Value::Number(t * t * (3.0 - 2.0 * t))
+            }
+            "radians" => Value::Number(num!(0) * std::f64::consts::PI / 180.0),
+            "degrees" => Value::Number(num!(0) * 180.0 / std::f64::consts::PI),
+            "pi" => Value::Number(std::f64::consts::PI),
+            "e" => Value::Number(std::f64::consts::E),
+            // v0.7 颜色函数
+            "rgb_to_hsl" => {
+                let r = num!(0) / 255.0;
+                let g = num!(1) / 255.0;
+                let b = num!(2) / 255.0;
+                let max = r.max(g).max(b);
+                let min = r.min(g).min(b);
+                let l = (max + min) / 2.0;
+                if (max - min).abs() < 1e-10 {
+                    Value::Tuple(vec![Value::Number(0.0), Value::Number(0.0), Value::Number(l)])
+                } else {
+                    let d = max - min;
+                    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+                    let h = if max == r {
+                        ((g - b) / d) % 6.0
+                    } else if max == g {
+                        (b - r) / d + 2.0
+                    } else {
+                        (r - g) / d + 4.0
+                    };
+                    let h = if h < 0.0 { h + 6.0 } else { h } * 60.0;
+                    Value::Tuple(vec![Value::Number(h), Value::Number(s), Value::Number(l)])
+                }
+            }
+            "hsl_to_rgb" => {
+                let h = num!(0) / 360.0;
+                let s = num!(1);
+                let l = num!(2);
+                let r; let g; let b;
+                if s == 0.0 {
+                    r = l; g = l; b = l;
+                } else {
+                    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+                    let p = 2.0 * l - q;
+                    let hue_to_rgb = |p: f64, q: f64, mut t: f64| -> f64 {
+                        if t < 0.0 { t += 1.0; }
+                        if t > 1.0 { t -= 1.0; }
+                        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
+                        if t < 1.0 / 2.0 { return q; }
+                        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+                        p
+                    };
+                    r = hue_to_rgb(p, q, h + 1.0 / 3.0);
+                    g = hue_to_rgb(p, q, h);
+                    b = hue_to_rgb(p, q, h - 1.0 / 3.0);
+                }
+                Value::Tuple(vec![
+                    Value::Number((r * 255.0).round()),
+                    Value::Number((g * 255.0).round()),
+                    Value::Number((b * 255.0).round()),
+                ])
+            }
+            "lerp_color" => {
+                let c1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
+                let c2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
+                let t = num!(2);
+                if c1.len() >= 3 && c2.len() >= 3 {
+                    let r = c1[0].as_number().unwrap_or(0.0) * (1.0 - t) + c2[0].as_number().unwrap_or(0.0) * t;
+                    let g = c1[1].as_number().unwrap_or(0.0) * (1.0 - t) + c2[1].as_number().unwrap_or(0.0) * t;
+                    let b = c1[2].as_number().unwrap_or(0.0) * (1.0 - t) + c2[2].as_number().unwrap_or(0.0) * t;
+                    Value::Tuple(vec![Value::Number(r), Value::Number(g), Value::Number(b)])
+                } else {
+                    Value::Tuple(vec![])
+                }
+            }
+            "brighten" => {
+                let c = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
+                let amt = num!(1);
+                if c.len() >= 3 {
+                    Value::Tuple(vec![
+                        Value::Number((c[0].as_number().unwrap_or(0.0) + amt * 255.0).clamp(0.0, 255.0)),
+                        Value::Number((c[1].as_number().unwrap_or(0.0) + amt * 255.0).clamp(0.0, 255.0)),
+                        Value::Number((c[2].as_number().unwrap_or(0.0) + amt * 255.0).clamp(0.0, 255.0)),
+                    ])
+                } else { Value::Tuple(vec![]) }
+            }
+            "darken" => {
+                let c = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
+                let amt = num!(1);
+                if c.len() >= 3 {
+                    Value::Tuple(vec![
+                        Value::Number((c[0].as_number().unwrap_or(0.0) - amt * 255.0).clamp(0.0, 255.0)),
+                        Value::Number((c[1].as_number().unwrap_or(0.0) - amt * 255.0).clamp(0.0, 255.0)),
+                        Value::Number((c[2].as_number().unwrap_or(0.0) - amt * 255.0).clamp(0.0, 255.0)),
+                    ])
+                } else { Value::Tuple(vec![]) }
+            }
+            "saturate" => {
+                let c = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
+                let amt = num!(1);
+                if c.len() >= 3 {
+                    let r = c[0].as_number().unwrap_or(0.0);
+                    let g = c[1].as_number().unwrap_or(0.0);
+                    let b = c[2].as_number().unwrap_or(0.0);
+                    let gray = (r + g + b) / 3.0;
+                    Value::Tuple(vec![
+                        Value::Number(gray + (r - gray) * (1.0 + amt)),
+                        Value::Number(gray + (g - gray) * (1.0 + amt)),
+                        Value::Number(gray + (b - gray) * (1.0 + amt)),
+                    ])
+                } else { Value::Tuple(vec![]) }
+            }
             "bool" => match &args.get(0) {
                 Some(Value::Number(n)) => Value::Bool(*n != 0.0),
                 Some(Value::Bool(b)) => Value::Bool(*b),
@@ -423,6 +569,49 @@ impl Interpreter {
                 } else {
                     Value::Bool(false)
                 }
+            }
+            // v0.7 字符串函数
+            "str" => {
+                let s = match &args.get(0) {
+                    Some(Value::Number(n)) => format!("{}", n),
+                    Some(Value::Bool(b)) => b.to_string(),
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Color(r, g, b)) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+                    Some(Value::None) => "none".to_string(),
+                    _ => "".to_string(),
+                };
+                Value::String(s)
+            }
+            "concat" => {
+                let mut s = String::new();
+                for a in args {
+                    if let Some(Value::String(t)) = Some(a) {
+                        s.push_str(t);
+                    } else {
+                        s.push_str(&format!("{:?}", a));
+                    }
+                }
+                Value::String(s)
+            }
+            "substr" => {
+                let s = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
+                let start = num!(1) as usize;
+                let len = num!(2) as usize;
+                let end = (start + len).min(s.len());
+                Value::String(s[start.min(s.len())..end].to_string())
+            }
+            "upper" => {
+                let s = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
+                Value::String(s.to_uppercase())
+            }
+            "lower" => {
+                let s = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
+                Value::String(s.to_lowercase())
+            }
+            "find" => {
+                let s = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
+                let sub = args.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+                Value::Number(s.find(&sub).map(|i| i as f64).unwrap_or(-1.0))
             }
             "line" => {
                 let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
@@ -1161,6 +1350,117 @@ impl Interpreter {
         Ok(Value::Struct(Rc::new(RefCell::new(fields))))
     }
 
+    /// v0.7 后处理函数：grain / vignette / blur / sharpen
+    pub fn apply_postprocess(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
+        let canvas = match &mut self.canvas {
+            Some(c) => c,
+            None => return Err(VglError::new("后处理需要先声明 canvas", self.current_pos)),
+        };
+        let (w, h) = (canvas.width, canvas.height);
+        let pixels = canvas.pixels.clone();
+        match name {
+            "grain" => {
+                // grain(intensity)：每像素随机扰动 ±intensity*255
+                let intensity = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.1) as f32;
+                let mut rng = self.rng.borrow_mut();
+                for y in 0..h {
+                    for x in 0..w {
+                        let idx = ((y * w + x) * 4) as usize;
+                        let noise: f32 = rng.gen_range(-1.0..1.0) * intensity * 255.0;
+                        canvas.pixels[idx] = (pixels[idx] + noise).clamp(0.0, 255.0);
+                        canvas.pixels[idx + 1] = (pixels[idx + 1] + noise).clamp(0.0, 255.0);
+                        canvas.pixels[idx + 2] = (pixels[idx + 2] + noise).clamp(0.0, 255.0);
+                    }
+                }
+            }
+            "vignette" => {
+                // vignette(strength, radius)：边缘变暗
+                let strength = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.5) as f32;
+                let radius = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.7) as f32;
+                let cx = w as f32 / 2.0;
+                let cy = h as f32 / 2.0;
+                let max_d = (cx * cx + cy * cy).sqrt();
+                let r = radius * max_d;
+                for y in 0..h {
+                    for x in 0..w {
+                        let idx = ((y * w + x) * 4) as usize;
+                        let dx = x as f32 - cx;
+                        let dy = y as f32 - cy;
+                        let d = (dx * dx + dy * dy).sqrt();
+                        let factor = if d > r {
+                            1.0 - strength * ((d - r) / (max_d - r)).min(1.0)
+                        } else {
+                            1.0
+                        };
+                        canvas.pixels[idx] = pixels[idx] * factor;
+                        canvas.pixels[idx + 1] = pixels[idx + 1] * factor;
+                        canvas.pixels[idx + 2] = pixels[idx + 2] * factor;
+                    }
+                }
+            }
+            "blur" => {
+                // blur(radius)：简单盒模糊
+                let r = args.get(0).and_then(|v| v.as_number()).unwrap_or(2.0) as i32;
+                if r > 0 {
+                    let r = r.min(20);
+                    let mut sum_r; let mut sum_g; let mut sum_b; let mut count;
+                    for y in 0..h {
+                        for x in 0..w {
+                            sum_r = 0.0; sum_g = 0.0; sum_b = 0.0; count = 0;
+                            for dy in -r..=r {
+                                let yy = y as i32 + dy;
+                                if yy < 0 || yy >= h as i32 { continue; }
+                                for dx in -r..=r {
+                                    let xx = x as i32 + dx;
+                                    if xx < 0 || xx >= w as i32 { continue; }
+                                    let idx = ((yy as u32 * w + xx as u32) * 4) as usize;
+                                    sum_r += pixels[idx];
+                                    sum_g += pixels[idx + 1];
+                                    sum_b += pixels[idx + 2];
+                                    count += 1;
+                                }
+                            }
+                            let idx = ((y * w + x) * 4) as usize;
+                            let c = count as f32;
+                            canvas.pixels[idx] = sum_r / c;
+                            canvas.pixels[idx + 1] = sum_g / c;
+                            canvas.pixels[idx + 2] = sum_b / c;
+                        }
+                    }
+                }
+            }
+            "sharpen" => {
+                // sharpen(amount)：拉普拉斯锐化
+                let amount = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.5) as f32;
+                for y in 0..h {
+                    for x in 0..w {
+                        let idx = ((y * w + x) * 4) as usize;
+                        // 中心 4，四邻 -1
+                        let get = |dx: i32, dy: i32| -> (f32, f32, f32) {
+                            let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as u32;
+                            let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as u32;
+                            let i = ((yy * w + xx) * 4) as usize;
+                            (pixels[i], pixels[i + 1], pixels[i + 2])
+                        };
+                        let (cr, cg, cb) = get(0, 0);
+                        let (ur, ug, ub) = get(0, -1);
+                        let (dr, dg, db) = get(0, 1);
+                        let (lr, lg, lb) = get(-1, 0);
+                        let (rr, rg, rb) = get(1, 0);
+                        let sharp_r = cr + amount * (4.0 * cr - ur - dr - lr - rr);
+                        let sharp_g = cg + amount * (4.0 * cg - ug - dg - lg - rg);
+                        let sharp_b = cb + amount * (4.0 * cb - ub - db - lb - rb);
+                        canvas.pixels[idx] = sharp_r.clamp(0.0, 255.0);
+                        canvas.pixels[idx + 1] = sharp_g.clamp(0.0, 255.0);
+                        canvas.pixels[idx + 2] = sharp_b.clamp(0.0, 255.0);
+                    }
+                }
+            }
+            _ => return Err(VglError::new(format!("未知后处理: {}", name), self.current_pos)),
+        }
+        Ok(())
+    }
+
     pub fn compose_layer(&mut self, name: &str, blend: &str) -> VglResult<()> {
         let layer_rc = match self.layers.get(name) {
             Some(Value::Layer(lc)) => lc.clone(),
@@ -1201,6 +1501,55 @@ impl Interpreter {
                             255.0 - (255.0 - mr) * (255.0 - lr) / 255.0,
                             255.0 - (255.0 - mg) * (255.0 - lg) / 255.0,
                             255.0 - (255.0 - mb) * (255.0 - lb) / 255.0,
+                            ma.max(la),
+                        ),
+                        // v0.7 混合模式扩展
+                        "overlay" => (
+                            if mr < 128.0 { 2.0 * mr * lr / 255.0 } else { 255.0 - 2.0 * (255.0 - mr) * (255.0 - lr) / 255.0 },
+                            if mg < 128.0 { 2.0 * mg * lg / 255.0 } else { 255.0 - 2.0 * (255.0 - mg) * (255.0 - lg) / 255.0 },
+                            if mb < 128.0 { 2.0 * mb * lb / 255.0 } else { 255.0 - 2.0 * (255.0 - mb) * (255.0 - lb) / 255.0 },
+                            ma.max(la),
+                        ),
+                        "soft_light" => (
+                            (mr + lr * (mr - 0.5 * 255.0) / 127.5).clamp(0.0, 255.0),
+                            (mg + lg * (mg - 0.5 * 255.0) / 127.5).clamp(0.0, 255.0),
+                            (mb + lb * (mb - 0.5 * 255.0) / 127.5).clamp(0.0, 255.0),
+                            ma.max(la),
+                        ),
+                        "hard_light" => (
+                            if lr < 128.0 { 2.0 * mr * lr / 255.0 } else { 255.0 - 2.0 * (255.0 - mr) * (255.0 - lr) / 255.0 },
+                            if lg < 128.0 { 2.0 * mg * lg / 255.0 } else { 255.0 - 2.0 * (255.0 - mg) * (255.0 - lg) / 255.0 },
+                            if lb < 128.0 { 2.0 * mb * lb / 255.0 } else { 255.0 - 2.0 * (255.0 - mb) * (255.0 - lb) / 255.0 },
+                            ma.max(la),
+                        ),
+                        "color_dodge" => (
+                            if lr == 255.0 { 255.0 } else { (mr * 255.0 / (255.0 - lr)).min(255.0) },
+                            if lg == 255.0 { 255.0 } else { (mg * 255.0 / (255.0 - lg)).min(255.0) },
+                            if lb == 255.0 { 255.0 } else { (mb * 255.0 / (255.0 - lb)).min(255.0) },
+                            ma.max(la),
+                        ),
+                        "color_burn" => (
+                            if lr == 0.0 { 0.0 } else { (255.0 - (255.0 - mr) * 255.0 / lr).max(0.0) },
+                            if lg == 0.0 { 0.0 } else { (255.0 - (255.0 - mg) * 255.0 / lg).max(0.0) },
+                            if lb == 0.0 { 0.0 } else { (255.0 - (255.0 - mb) * 255.0 / lb).max(0.0) },
+                            ma.max(la),
+                        ),
+                        "linear_burn" => (
+                            (mr + lr - 255.0).max(0.0),
+                            (mg + lg - 255.0).max(0.0),
+                            (mb + lb - 255.0).max(0.0),
+                            ma.max(la),
+                        ),
+                        "difference" => (
+                            (mr - lr).abs(),
+                            (mg - lg).abs(),
+                            (mb - lb).abs(),
+                            ma.max(la),
+                        ),
+                        "exclusion" => (
+                            mr + lr - 2.0 * mr * lr / 255.0,
+                            mg + lg - 2.0 * mg * lg / 255.0,
+                            mb + lb - 2.0 * mb * lb / 255.0,
                             ma.max(la),
                         ),
                         _ => {
