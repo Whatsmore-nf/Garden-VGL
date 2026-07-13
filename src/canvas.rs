@@ -231,6 +231,172 @@ impl Canvas {
             self.pixels[i + 3] = 255.0;
         }
     }
+
+    // v0.75 新增绘图原语
+
+    /// 矩形填充
+    pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, r: f32, g: f32, b: f32) {
+        let x_end = (x + w).min(self.width as i32);
+        let y_end = (y + h).min(self.height as i32);
+        let x_start = x.max(0);
+        let y_start = y.max(0);
+        for yy in y_start..y_end {
+            for xx in x_start..x_end {
+                let idx = ((yy as u32 * self.width + xx as u32) * 4) as usize;
+                self.pixels[idx] = r;
+                self.pixels[idx + 1] = g;
+                self.pixels[idx + 2] = b;
+                self.pixels[idx + 3] = 255.0;
+            }
+        }
+    }
+
+    /// 圆形填充（使用中点圆算法的填充版本）
+    pub fn fill_circle(&mut self, cx: i32, cy: i32, radius: i32, r: f32, g: f32, b: f32) {
+        if radius <= 0 { return; }
+        for dy in -radius..=radius {
+            let yy = cy + dy;
+            if yy < 0 || yy >= self.height as i32 { continue; }
+            let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
+            for dx in -dx_max..=dx_max {
+                let xx = cx + dx;
+                if xx < 0 || xx >= self.width as i32 { continue; }
+                let idx = ((yy as u32 * self.width + xx as u32) * 4) as usize;
+                self.pixels[idx] = r;
+                self.pixels[idx + 1] = g;
+                self.pixels[idx + 2] = b;
+                self.pixels[idx + 3] = 255.0;
+            }
+        }
+    }
+
+    /// 椭圆填充
+    pub fn fill_ellipse(&mut self, cx: i32, cy: i32, rx: i32, ry: i32, r: f32, g: f32, b: f32) {
+        if rx <= 0 || ry <= 0 { return; }
+        for dy in -ry..=ry {
+            let yy = cy + dy;
+            if yy < 0 || yy >= self.height as i32 { continue; }
+            let dx_max = ((rx as f64 * rx as f64 * (1.0 - (dy * dy) as f64 / (ry * ry) as f64))).sqrt() as i32;
+            for dx in -dx_max..=dx_max {
+                let xx = cx + dx;
+                if xx < 0 || xx >= self.width as i32 { continue; }
+                let idx = ((yy as u32 * self.width + xx as u32) * 4) as usize;
+                self.pixels[idx] = r;
+                self.pixels[idx + 1] = g;
+                self.pixels[idx + 2] = b;
+                self.pixels[idx + 3] = 255.0;
+            }
+        }
+    }
+
+    /// 多边形填充（扫描线算法）
+    pub fn fill_polygon(&mut self, pts: &[(i32, i32)], r: f32, g: f32, b: f32) {
+        if pts.len() < 3 { return; }
+        let y_min = pts.iter().map(|p| p.1).min().unwrap_or(0).max(0);
+        let y_max = pts.iter().map(|p| p.1).max().unwrap_or(0).min(self.height as i32 - 1);
+        for y in y_min..=y_max {
+            let mut intersections = Vec::new();
+            let n = pts.len();
+            for i in 0..n {
+                let (x1, y1) = pts[i];
+                let (x2, y2) = pts[(i + 1) % n];
+                if (y1 <= y && y2 > y) || (y2 <= y && y1 > y) {
+                    let t = (y - y1) as f64 / (y2 - y1) as f64;
+                    intersections.push(x1 as f64 + t * (x2 - x1) as f64);
+                }
+            }
+            intersections.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut i = 0;
+            while i + 1 < intersections.len() {
+                let x_start = intersections[i].ceil() as i32;
+                let x_end = intersections[i + 1].floor() as i32;
+                for x in x_start.max(0)..=x_end.min(self.width as i32 - 1) {
+                    let idx = ((y as u32 * self.width + x as u32) * 4) as usize;
+                    self.pixels[idx] = r;
+                    self.pixels[idx + 1] = g;
+                    self.pixels[idx + 2] = b;
+                    self.pixels[idx + 3] = 255.0;
+                }
+                i += 2;
+            }
+        }
+    }
+
+    /// 泛洪填充（从种子点开始，将相似颜色区域替换为新颜色）
+    pub fn flood_fill(&mut self, x: i32, y: i32, r: f32, g: f32, b: f32) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 { return; }
+        let start_idx = ((y as u32 * self.width + x as u32) * 4) as usize;
+        let target_r = self.pixels[start_idx];
+        let target_g = self.pixels[start_idx + 1];
+        let target_b = self.pixels[start_idx + 2];
+        // 如果目标色和填充色相同，无需操作
+        if (target_r - r).abs() < 0.5 && (target_g - g).abs() < 0.5 && (target_b - b).abs() < 0.5 {
+            return;
+        }
+        let mut stack = vec![(x, y)];
+        let w = self.width as i32;
+        let h = self.height as i32;
+        while let Some((cx, cy)) = stack.pop() {
+            if cx < 0 || cy < 0 || cx >= w || cy >= h { continue; }
+            let idx = ((cy as u32 * self.width + cx as u32) * 4) as usize;
+            // 颜色匹配（容差 2.0）
+            if (self.pixels[idx] - target_r).abs() > 2.0
+                || (self.pixels[idx + 1] - target_g).abs() > 2.0
+                || (self.pixels[idx + 2] - target_b).abs() > 2.0
+            { continue; }
+            self.pixels[idx] = r;
+            self.pixels[idx + 1] = g;
+            self.pixels[idx + 2] = b;
+            self.pixels[idx + 3] = 255.0;
+            stack.push((cx + 1, cy));
+            stack.push((cx - 1, cy));
+            stack.push((cx, cy + 1));
+            stack.push((cx, cy - 1));
+        }
+    }
+
+    /// 椭圆轮廓绘制
+    pub fn draw_ellipse(&mut self, cx: i32, cy: i32, rx: i32, ry: i32, width: f64, r: f32, g: f32, b: f32) {
+        if rx <= 0 || ry <= 0 { return; }
+        // 用参数方程采样点，然后连线
+        let steps = ((rx + ry) as f64 * 0.5 * std::f64::consts::PI).max(16.0) as usize;
+        let mut prev: Option<(i32, i32)> = None;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64 * std::f64::consts::PI * 2.0;
+            let x = cx + (t.cos() * rx as f64).round() as i32;
+            let y = cy + (t.sin() * ry as f64).round() as i32;
+            if let Some((px, py)) = prev {
+                self.draw_line(px, py, x, y, width, r, g, b);
+            }
+            prev = Some((x, y));
+        }
+    }
+
+    /// 弧线绘制（从 start_angle 到 end_angle，弧度制）
+    pub fn draw_arc(&mut self, cx: i32, cy: i32, radius: i32, start: f64, end: f64, width: f64, r: f32, g: f32, b: f32) {
+        if radius <= 0 { return; }
+        let steps = ((end - start) * radius as f64).max(8.0) as usize;
+        let mut prev: Option<(i32, i32)> = None;
+        for i in 0..=steps {
+            let t = start + (end - start) * (i as f64 / steps as f64);
+            let x = cx + (t.cos() * radius as f64).round() as i32;
+            let y = cy + (t.sin() * radius as f64).round() as i32;
+            if let Some((px, py)) = prev {
+                self.draw_line(px, py, x, y, width, r, g, b);
+            }
+            prev = Some((x, y));
+        }
+    }
+
+    /// 矩形轮廓绘制
+    pub fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, width: f64, r: f32, g: f32, b: f32) {
+        let x2 = x + w;
+        let y2 = y + h;
+        self.draw_line(x, y, x2, y, width, r, g, b);
+        self.draw_line(x2, y, x2, y2, width, r, g, b);
+        self.draw_line(x2, y2, x, y2, width, r, g, b);
+        self.draw_line(x, y2, x, y, width, r, g, b);
+    }
 }
 
 // ============================================================

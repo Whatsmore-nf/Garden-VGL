@@ -297,6 +297,15 @@ impl Interpreter {
             self.apply_postprocess(name, &arg_vals)?;
             return Ok(Value::None);
         }
+        // v0.75 填充函数（直接绘制，不经 stroke）
+        if matches!(name, "fill_rect" | "fill_circle" | "fill_ellipse" | "fill_polygon" | "flood_fill") {
+            let mut arg_vals = Vec::new();
+            for a in args {
+                arg_vals.push(self.eval(a, env.clone())?);
+            }
+            self.apply_fill(name, &arg_vals)?;
+            return Ok(Value::None);
+        }
         // struct 构造
         if self.struct_defs.contains_key(name) {
             return self.construct_struct(name, args, kwargs, env);
@@ -613,6 +622,68 @@ impl Interpreter {
                 let sub = args.get(1).and_then(|v| v.as_string()).unwrap_or_default();
                 Value::Number(s.find(&sub).map(|i| i as f64).unwrap_or(-1.0))
             }
+            // v0.75 材质库预设
+            "preset" => {
+                let name = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
+                let mut m = HashMap::new();
+                match name.as_str() {
+                    "watercolor" => {
+                        // 水彩：柔和、半透明、轻微噪声
+                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(180.0), Value::Number(200.0), Value::Number(220.0)]));
+                        m.insert("noise".to_string(), Value::Number(0.15));
+                        m.insert("alpha".to_string(), Value::Number(0.6));
+                    }
+                    "oil_painting" => {
+                        // 油画：厚重、不透明、中等噪声
+                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(150.0), Value::Number(100.0), Value::Number(80.0)]));
+                        m.insert("noise".to_string(), Value::Number(0.3));
+                        m.insert("alpha".to_string(), Value::Number(1.0));
+                    }
+                    "pencil_sketch" => {
+                        // 铅笔素描：灰度、高噪声、半透明
+                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(60.0), Value::Number(60.0), Value::Number(60.0)]));
+                        m.insert("noise".to_string(), Value::Number(0.5));
+                        m.insert("alpha".to_string(), Value::Number(0.7));
+                    }
+                    "ink_wash" => {
+                        // 水墨：黑色、低噪声、半透明
+                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(20.0), Value::Number(20.0), Value::Number(30.0)]));
+                        m.insert("noise".to_string(), Value::Number(0.08));
+                        m.insert("alpha".to_string(), Value::Number(0.8));
+                    }
+                    "neon" => {
+                        // 霓虹：亮色、无噪声、不透明
+                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(255.0), Value::Number(50.0), Value::Number(200.0)]));
+                        m.insert("noise".to_string(), Value::Number(0.0));
+                        m.insert("alpha".to_string(), Value::Number(1.0));
+                    }
+                    "metal" => {
+                        // 金属：灰度、中等噪声、不透明
+                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(180.0), Value::Number(180.0), Value::Number(190.0)]));
+                        m.insert("noise".to_string(), Value::Number(0.2));
+                        m.insert("alpha".to_string(), Value::Number(1.0));
+                    }
+                    "pastel" => {
+                        // 粉彩：柔和色、轻噪声、半透明
+                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(255.0), Value::Number(180.0), Value::Number(200.0)]));
+                        m.insert("noise".to_string(), Value::Number(0.1));
+                        m.insert("alpha".to_string(), Value::Number(0.75));
+                    }
+                    "airbrush" => {
+                        // 喷枪：任意色、低噪声、低透明度
+                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(100.0), Value::Number(150.0), Value::Number(255.0)]));
+                        m.insert("noise".to_string(), Value::Number(0.05));
+                        m.insert("alpha".to_string(), Value::Number(0.4));
+                    }
+                    _ => {
+                        return Err(VglError::new(
+                            format!("未知材质预设: '{}'（可用: watercolor/oil_painting/pencil_sketch/ink_wash/neon/metal/pastel/airbrush）", name),
+                            self.current_pos,
+                        ));
+                    }
+                }
+                Value::Material(m)
+            }
             "line" => {
                 let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
                 let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
@@ -623,6 +694,39 @@ impl Interpreter {
                 let cy = num!(1) as i32;
                 let r = num!(2) as i32;
                 Value::Path("circle".into(), vec![Value::Number(cx as f64), Value::Number(cy as f64), Value::Number(r as f64)])
+            }
+            // v0.75 新增绘图原语
+            "rect" => {
+                let x = num!(0);
+                let y = num!(1);
+                let w = num!(2);
+                let h = num!(3);
+                Value::Path("rect".into(), vec![Value::Number(x), Value::Number(y), Value::Number(w), Value::Number(h)])
+            }
+            "ellipse" => {
+                let cx = num!(0);
+                let cy = num!(1);
+                let rx = num!(2);
+                let ry = num!(3);
+                Value::Path("ellipse".into(), vec![Value::Number(cx), Value::Number(cy), Value::Number(rx), Value::Number(ry)])
+            }
+            "arc" => {
+                let cx = num!(0);
+                let cy = num!(1);
+                let r = num!(2);
+                let start = num!(3);
+                let end = num!(4);
+                Value::Path("arc".into(), vec![Value::Number(cx), Value::Number(cy), Value::Number(r), Value::Number(start), Value::Number(end)])
+            }
+            "polygon" => {
+                // polygon(p1, p2, p3, ...) - 任意数量点
+                Value::Path("polygon".into(), args.to_vec())
+            }
+            "triangle" => {
+                let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
+                let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
+                let p3 = args.get(2).and_then(|v| v.as_tuple()).unwrap_or_default();
+                Value::Path("triangle".into(), vec![Value::Tuple(p1), Value::Tuple(p2), Value::Tuple(p3)])
             }
             "bezier" => {
                 let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
@@ -1117,6 +1221,67 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            // v0.75 新增 Path 类型（材质分支）
+                            "rect" => {
+                                let x = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                                let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                                let w = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                                let h = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                                let x2 = x + w;
+                                let y2 = y + h;
+                                canvas.draw_line_mat(x, y, x2, y, width, &mat);
+                                canvas.draw_line_mat(x2, y, x2, y2, width, &mat);
+                                canvas.draw_line_mat(x2, y2, x, y2, width, &mat);
+                                canvas.draw_line_mat(x, y2, x, y, width, &mat);
+                            }
+                            "ellipse" => {
+                                let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                                let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                                let rx = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0);
+                                let ry = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0);
+                                let steps = ((rx + ry) * 0.5 * std::f64::consts::PI).max(16.0) as usize;
+                                let mut prev: Option<(i32, i32)> = None;
+                                for i in 0..=steps {
+                                    let t = i as f64 / steps as f64 * std::f64::consts::PI * 2.0;
+                                    let px = cx + (t.cos() * rx).round() as i32;
+                                    let py = cy + (t.sin() * ry).round() as i32;
+                                    if let Some((ppx, ppy)) = prev {
+                                        canvas.draw_line_mat(ppx, ppy, px, py, width, &mat);
+                                    }
+                                    prev = Some((px, py));
+                                }
+                            }
+                            "arc" => {
+                                let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                                let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                                let rad = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0);
+                                let start = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0);
+                                let end = args.get(4).and_then(|v| v.as_number()).unwrap_or(0.0);
+                                let steps = ((end - start) * rad).max(8.0) as usize;
+                                let mut prev: Option<(i32, i32)> = None;
+                                for i in 0..=steps {
+                                    let t = start + (end - start) * (i as f64 / steps as f64);
+                                    let px = cx + (t.cos() * rad).round() as i32;
+                                    let py = cy + (t.sin() * rad).round() as i32;
+                                    if let Some((ppx, ppy)) = prev {
+                                        canvas.draw_line_mat(ppx, ppy, px, py, width, &mat);
+                                    }
+                                    prev = Some((px, py));
+                                }
+                            }
+                            "polygon" | "triangle" => {
+                                let pts: Vec<(i32, i32)> = args.iter().filter_map(|v| {
+                                    let t = v.as_tuple()?;
+                                    Some((t.get(0)?.as_number()? as i32, t.get(1)?.as_number()? as i32))
+                                }).collect();
+                                if pts.len() >= 2 {
+                                    for i in 0..pts.len() {
+                                        let (x1, y1) = pts[i];
+                                        let (x2, y2) = pts[(i + 1) % pts.len()];
+                                        canvas.draw_line_mat(x1, y1, x2, y2, width, &mat);
+                                    }
+                                }
+                            }
                             _ => {}
                         },
                         _ => {
@@ -1218,6 +1383,43 @@ impl Interpreter {
                                     p2.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
                                     width, r, g, b,
                                 );
+                            }
+                        }
+                    }
+                    // v0.75 新增 Path 类型
+                    "rect" => {
+                        let x = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        let w = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        let h = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        canvas.draw_rect(x, y, w, h, width, r, g, b);
+                    }
+                    "ellipse" => {
+                        let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        let rx = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        let ry = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        canvas.draw_ellipse(cx, cy, rx, ry, width, r, g, b);
+                    }
+                    "arc" => {
+                        let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        let rad = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                        let start = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0);
+                        let end = args.get(4).and_then(|v| v.as_number()).unwrap_or(0.0);
+                        canvas.draw_arc(cx, cy, rad, start, end, width, r, g, b);
+                    }
+                    "polygon" | "triangle" => {
+                        // 闭合多边形轮廓
+                        let pts: Vec<(i32, i32)> = args.iter().filter_map(|v| {
+                            let t = v.as_tuple()?;
+                            Some((t.get(0)?.as_number()? as i32, t.get(1)?.as_number()? as i32))
+                        }).collect();
+                        if pts.len() >= 2 {
+                            for i in 0..pts.len() {
+                                let (x1, y1) = pts[i];
+                                let (x2, y2) = pts[(i + 1) % pts.len()];
+                                canvas.draw_line(x1, y1, x2, y2, width, r, g, b);
                             }
                         }
                     }
@@ -1348,6 +1550,66 @@ impl Interpreter {
             }
         }
         Ok(Value::Struct(Rc::new(RefCell::new(fields))))
+    }
+
+    /// v0.75 填充函数：fill_rect / fill_circle / fill_ellipse / fill_polygon / flood_fill
+    pub fn apply_fill(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
+        let canvas = match &mut self.canvas {
+            Some(c) => c,
+            None => return Err(VglError::new("填充需要先声明 canvas", self.current_pos)),
+        };
+        // 提取颜色参数（最后一个参数，支持 (r,g,b) 元组或 #color）
+        let extract_color = |idx: usize| -> (f32, f32, f32) {
+            match args.get(idx) {
+                Some(Value::Tuple(t)) if t.len() >= 3 => (
+                    t[0].as_number().unwrap_or(0.0) as f32,
+                    t[1].as_number().unwrap_or(0.0) as f32,
+                    t[2].as_number().unwrap_or(0.0) as f32,
+                ),
+                Some(Value::Color(r, g, b)) => (*r as f32, *g as f32, *b as f32),
+                _ => (0.0, 0.0, 0.0),
+            }
+        };
+        // 提取整数参数
+        let n = |idx: usize| -> i32 {
+            args.get(idx).and_then(|v| v.as_number()).unwrap_or(0.0) as i32
+        };
+        match name {
+            "fill_rect" => {
+                let (r, g, b) = extract_color(4);
+                canvas.fill_rect(n(0), n(1), n(2), n(3), r, g, b);
+            }
+            "fill_circle" => {
+                let (r, g, b) = extract_color(3);
+                canvas.fill_circle(n(0), n(1), n(2), r, g, b);
+            }
+            "fill_ellipse" => {
+                let (r, g, b) = extract_color(4);
+                canvas.fill_ellipse(n(0), n(1), n(2), n(3), r, g, b);
+            }
+            "fill_polygon" => {
+                let (r, g, b) = extract_color(1);
+                // 第一个参数是点数组
+                let pts: Vec<(i32, i32)> = match args.get(0) {
+                    Some(Value::Array(arr)) => arr.borrow().iter().filter_map(|v| {
+                        let t = v.as_tuple()?;
+                        Some((t.get(0)?.as_number()? as i32, t.get(1)?.as_number()? as i32))
+                    }).collect(),
+                    Some(Value::Tuple(t)) => t.iter().filter_map(|v| {
+                        let pt = v.as_tuple()?;
+                        Some((pt.get(0)?.as_number()? as i32, pt.get(1)?.as_number()? as i32))
+                    }).collect(),
+                    _ => vec![],
+                };
+                canvas.fill_polygon(&pts, r, g, b);
+            }
+            "flood_fill" => {
+                let (r, g, b) = extract_color(2);
+                canvas.flood_fill(n(0), n(1), r, g, b);
+            }
+            _ => return Err(VglError::new(format!("未知填充: {}", name), self.current_pos)),
+        }
+        Ok(())
     }
 
     /// v0.7 后处理函数：grain / vignette / blur / sharpen
