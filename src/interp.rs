@@ -510,6 +510,29 @@ impl Interpreter {
                 }
                 Value::Image(Rc::new(canvas))
             }
+            "pixel_at" => {
+                // pixel_at(img, x, y) → (r, g, b) 元组
+                let img_val = args.get(0).cloned().unwrap_or(Value::None);
+                let x = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                let y = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                match img_val {
+                    Value::Image(c) => {
+                        if x < 0 || y < 0 || x as u32 >= c.width || y as u32 >= c.height {
+                            return Err(VglError::new(
+                                format!("pixel_at 坐标越界: ({}, {})", x, y),
+                                self.current_pos,
+                            ));
+                        }
+                        let idx = (y as u32 * c.width + x as u32) as usize * 4;
+                        Value::Tuple(vec![
+                            Value::Number(c.pixels[idx] as f64),
+                            Value::Number(c.pixels[idx + 1] as f64),
+                            Value::Number(c.pixels[idx + 2] as f64),
+                        ])
+                    }
+                    _ => return Err(VglError::new("pixel_at 需要 image 参数", self.current_pos)),
+                }
+            }
             _ => return Ok(None),
         };
         Ok(Some(v))

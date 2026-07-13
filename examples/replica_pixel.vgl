@@ -1,0 +1,12 @@
+// v0.6 像素法复刻：256x256
+canvas 256x256
+bg #000000
+
+let src = load("//?/E:/garden image/output/rings.png")
+for y in 0..256 {
+    for x in 0..256 {
+        pixel(x: x, y: y, rgb: pixel_at(src, x, y))
+    }
+}
+
+render "replica_pixel.png"
