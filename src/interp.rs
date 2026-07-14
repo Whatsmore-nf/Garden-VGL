@@ -13,7 +13,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::ast::{Env, Expr, Stmt, StmtWithPos, Value};
-use crate::canvas::{Canvas, MaterialParams};
+use crate::canvas::{draw_polyline_join, Canvas, MaterialParams};
 use crate::error::{clamp_f32, clamp_u8, format_error, VglError, VglResult};
 use crate::lexer::Lexer;
 use crate::noise::{fbm, perlin, perlin_seeded, worley};
@@ -96,6 +96,8 @@ pub struct Interpreter {
     pub transform_stack: Vec<Transform>,  // v0.8 变换栈
     pub clip_stack: Vec<ClipRect>,         // v0.8 裁剪栈
     pub noise_perm: Option<[usize; 512]>,  // v0.8 可种子化 Perlin 置换表
+    pub class_defs: HashMap<String, Rc<crate::ast::ClassData>>, // v0.9: 类定义
+    pub linear_mode: bool,                 // v0.9: sRGB 线性工作流开关
 }
 
 impl Interpreter {
@@ -115,6 +117,8 @@ impl Interpreter {
             transform_stack: vec![Transform::identity()],
             clip_stack: Vec::new(),
             noise_perm: None,
+            class_defs: HashMap::new(),
+            linear_mode: false,
         }
     }
 
@@ -123,12 +127,32 @@ impl Interpreter {
             .push(crate::error::VglWarning::new(msg, self.current_pos));
     }
 
+    // v0.9: 将 Value 转换为字符串表示（供 as str 和 str() 内建函数共用）
+    pub fn value_to_string(&self, v: &Value) -> String {
+        match v {
+            Value::Number(n) => format!("{}", n),
+            Value::Bool(b) => b.to_string(),
+            Value::String(s) => s.clone(),
+            Value::Color(r, g, b, a) => {
+                if *a == 255 {
+                    format!("#{:02x}{:02x}{:02x}", r, g, b)
+                } else {
+                    format!("#{:02x}{:02x}{:02x}{:02x}", r, g, b, a)
+                }
+            }
+            Value::None => "none".to_string(),
+            _ => format!("{:?}", v),
+        }
+    }
+
     pub fn eval(&mut self, expr: &Expr, env: Rc<RefCell<Env>>) -> VglResult<Value> {
         match expr {
             Expr::Number(n) => Ok(Value::Number(*n)),
             Expr::String(s) => Ok(Value::String(s.clone())),
-            Expr::Color(r, g, b) => Ok(Value::Color(*r, *g, *b)),
+            Expr::Color(r, g, b, a) => Ok(Value::Color(*r, *g, *b, *a)),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
+            // v0.9: null 字面量
+            Expr::Null => Ok(Value::None),
             Expr::Ident(name) => {
                 if let Some(v) = env.borrow().get(name) {
                     Ok(v)
@@ -167,6 +191,26 @@ impl Interpreter {
                                     return Err(VglError::new("取模除零错误", self.current_pos));
                                 }
                                 a % b
+                            }
+                            // v0.9: 位运算符（对整数操作，f64→i64→运算→f64）
+                            "&" => (a.trunc() as i64 & b.trunc() as i64) as f64,
+                            "|" => (a.trunc() as i64 | b.trunc() as i64) as f64,
+                            "^" => (a.trunc() as i64 ^ b.trunc() as i64) as f64,
+                            "<<" => {
+                                let sh = b.trunc() as i64;
+                                if sh < 0 || sh >= 64 {
+                                    0.0
+                                } else {
+                                    ((a.trunc() as i64) << sh) as f64
+                                }
+                            }
+                            ">>" => {
+                                let sh = b.trunc() as i64;
+                                if sh < 0 || sh >= 64 {
+                                    0.0
+                                } else {
+                                    ((a.trunc() as i64) >> sh) as f64
+                                }
                             }
                             "<" => return Ok(Value::Bool(a < b)),
                             ">" => return Ok(Value::Bool(a > b)),
@@ -275,6 +319,77 @@ impl Interpreter {
                     _ => Err(VglError::new("not 作用于非 bool", self.current_pos)),
                 }
             }
+            // v0.9: 一元位反 ~（整数按位取反）
+            Expr::BitNot(e, pos) => {
+                self.current_pos = Some(*pos);
+                let v = self.eval(e, env.clone())?;
+                match v {
+                    Value::Number(n) => Ok(Value::Number(!(n.trunc() as i64) as f64)),
+                    _ => Err(VglError::new("~ 作用于非 number", self.current_pos)),
+                }
+            }
+            // v0.9: as 类型转换
+            Expr::As(e, type_name, pos) => {
+                self.current_pos = Some(*pos);
+                let v = self.eval(e, env.clone())?;
+                match type_name.as_str() {
+                    "int" => match v {
+                        Value::Number(n) => Ok(Value::Number(n.trunc() as i64 as f64)),
+                        Value::String(s) => s.parse::<f64>()
+                            .map(|n| Value::Number(n.trunc() as i64 as f64))
+                            .map_err(|_| VglError::new(format!("无法将字符串 '{}' 转为 int", s), self.current_pos)),
+                        Value::Bool(b) => Ok(Value::Number(if b { 1.0 } else { 0.0 })),
+                        _ => Err(VglError::new("as int 需要 number/string/bool", self.current_pos)),
+                    },
+                    "float" => match v {
+                        Value::Number(n) => Ok(Value::Number(n)),
+                        Value::String(s) => s.parse::<f64>()
+                            .map(Value::Number)
+                            .map_err(|_| VglError::new(format!("无法将字符串 '{}' 转为 float", s), self.current_pos)),
+                        Value::Bool(b) => Ok(Value::Number(if b { 1.0 } else { 0.0 })),
+                        _ => Err(VglError::new("as float 需要 number/string/bool", self.current_pos)),
+                    },
+                    "bool" => match v {
+                        Value::Number(n) => Ok(Value::Bool(n != 0.0)),
+                        Value::String(s) => Ok(Value::Bool(!s.is_empty())),
+                        Value::Bool(b) => Ok(Value::Bool(b)),
+                        Value::None => Ok(Value::Bool(false)),
+                        _ => Err(VglError::new("as bool 需要 number/string/bool/null", self.current_pos)),
+                    },
+                    "str" => Ok(Value::String(self.value_to_string(&v))),
+                    "color" => match v {
+                        Value::String(s) => {
+                            // 解析 "#RRGGBB" 或 "#RRGGBBAA" 格式
+                            let hex = s.trim_start_matches('#');
+                            let parse_hex = |h: &str| u8::from_str_radix(h, 16).unwrap_or(0);
+                            if hex.len() == 6 {
+                                Ok(Value::Color(parse_hex(&hex[0..2]), parse_hex(&hex[2..4]), parse_hex(&hex[4..6]), 255))
+                            } else if hex.len() == 8 {
+                                Ok(Value::Color(parse_hex(&hex[0..2]), parse_hex(&hex[2..4]), parse_hex(&hex[4..6]), parse_hex(&hex[6..8])))
+                            } else if hex.len() == 3 {
+                                Ok(Value::Color(
+                                    parse_hex(&format!("{}{}", &hex[0..1], &hex[0..1])),
+                                    parse_hex(&format!("{}{}", &hex[1..2], &hex[1..2])),
+                                    parse_hex(&format!("{}{}", &hex[2..3], &hex[2..3])),
+                                    255,
+                                ))
+                            } else {
+                                Err(VglError::new(format!("无法解析颜色: {}", s), self.current_pos))
+                            }
+                        }
+                        Value::Color(r, g, b, a) => Ok(Value::Color(r, g, b, a)),
+                        Value::Tuple(t) if t.len() == 3 || t.len() == 4 => {
+                            let r = t[0].as_number().unwrap_or(0.0) as u8;
+                            let g = t[1].as_number().unwrap_or(0.0) as u8;
+                            let b = t[2].as_number().unwrap_or(0.0) as u8;
+                            let a = if t.len() == 4 { t[3].as_number().unwrap_or(255.0) as u8 } else { 255 };
+                            Ok(Value::Color(r, g, b, a))
+                        }
+                        _ => Err(VglError::new("as color 需要 string/tuple/color", self.current_pos)),
+                    },
+                    _ => Err(VglError::new(format!("未知类型: {}（支持 int/float/bool/str/color）", type_name), self.current_pos)),
+                }
+            }
             Expr::Call(name, args, kwargs, pos) => {
                 self.current_pos = Some(*pos);
                 self.eval_call(name, args, kwargs, env)
@@ -314,13 +429,82 @@ impl Interpreter {
             Expr::FieldAccess(obj, field, pos) => {
                 self.current_pos = Some(*pos);
                 let obj_val = self.eval(obj, env.clone())?;
-                if let Value::Struct(s) = obj_val {
-                    let s_ref = s.borrow();
-                    s_ref.get(field).cloned().map(Ok).unwrap_or_else(|| {
+                match obj_val {
+                    Value::Struct(s) => {
+                        let s_ref = s.borrow();
+                        s_ref.get(field).cloned().map(Ok).unwrap_or_else(|| {
+                            Err(VglError::new(format!("字段不存在: {}", field), self.current_pos))
+                        })
+                    }
+                    // v0.9: enum 无参变体访问 EnumName.Variant
+                    Value::EnumDef(_, ref variants) => {
+                        if variants.contains_key(field) {
+                            let arity = variants[field];
+                            if arity == 0 {
+                                // 无关联值的变体
+                                let enum_name = if let Value::EnumDef(n, _) = &obj_val { n.clone() } else { String::new() };
+                                Ok(Value::Enum(enum_name, field.clone(), vec![]))
+                            } else {
+                                Err(VglError::new(format!("变体 {} 需要 {} 个参数", field, arity), self.current_pos))
+                            }
+                        } else {
+                            Err(VglError::new(format!("枚举无此变体: {}", field), self.current_pos))
+                        }
+                    }
+                    // v0.9: instance 字段访问
+                    Value::Instance(data) => {
+                        let data_ref = data.borrow();
+                        // 在自身字段查找
+                        if let Some(v) = data_ref.fields.get(field) {
+                            return Ok(v.clone());
+                        }
                         Err(VglError::new(format!("字段不存在: {}", field), self.current_pos))
-                    })
-                } else {
-                    Err(VglError::new("不是结构体", self.current_pos))
+                    }
+                    // v0.9: module 命名空间访问 Module.item
+                    Value::Module(_, ref mod_env) => {
+                        if let Some(v) = mod_env.borrow().get(field) {
+                            Ok(v)
+                        } else {
+                            Err(VglError::new(format!("模块中无此项: {}", field), self.current_pos))
+                        }
+                    }
+                    _ => Err(VglError::new("不是结构体/枚举/实例/模块", self.current_pos)),
+                }
+            }
+            // v0.9: 方法调用 obj.method(args)
+            Expr::MethodCall(obj_expr, method, args, kwargs, pos) => {
+                self.current_pos = Some(*pos);
+                let obj_val = self.eval(obj_expr, env.clone())?;
+                match &obj_val {
+                    // enum 构造：EnumName.Variant(args)
+                    Value::EnumDef(enum_name, variants) => {
+                        if let Some(&arity) = variants.get(method) {
+                            if args.len() != arity {
+                                return Err(VglError::new(
+                                    format!("变体 {} 需要 {} 个参数，得到 {}", method, arity, args.len()),
+                                    self.current_pos,
+                                ));
+                            }
+                            let mut vals = Vec::new();
+                            for a in args {
+                                vals.push(self.eval(a, env.clone())?);
+                            }
+                            return Ok(Value::Enum(enum_name.clone(), method.clone(), vals));
+                        } else {
+                            return Err(VglError::new(format!("枚举无此变体: {}", method), self.current_pos));
+                        }
+                    }
+                    // class 实例方法调用
+                    Value::Instance(data) => {
+                        let class_name = data.borrow().class_name.clone();
+                        let self_val = obj_val.clone();
+                        if let Some((params, body)) = self.lookup_method(&class_name, method)? {
+                            // 调用方法：绑定 self 并执行
+                            return self.invoke_method(&params, &body, args, kwargs, &self_val, env);
+                        }
+                        return Err(VglError::new(format!("方法不存在: {}", method), self.current_pos));
+                    }
+                    _ => Err(VglError::new("方法调用目标不是枚举/实例", self.current_pos)),
                 }
             }
         }
@@ -333,6 +517,14 @@ impl Interpreter {
         kwargs: &HashMap<String, Expr>,
         env: Rc<RefCell<Env>>,
     ) -> VglResult<Value> {
+        // v0.9: linear() — 开启 sRGB 线性工作流
+        if name == "linear" {
+            self.linear_mode = true;
+            if let Some(canvas) = &mut self.canvas {
+                canvas.linear_mode = true;
+            }
+            return Ok(Value::None);
+        }
         // compose / fill 内建（需要 self）
         if name == "compose" {
             let layer_name = self.eval(&args[0], env.clone())?.as_string().unwrap_or_default();
@@ -397,6 +589,10 @@ impl Interpreter {
         // struct 构造
         if self.struct_defs.contains_key(name) {
             return self.construct_struct(name, args, kwargs, env);
+        }
+        // v0.9: class 构造
+        if self.class_defs.contains_key(name) {
+            return self.construct_class(name, args, kwargs, env);
         }
         // 求值参数
         let mut arg_vals = Vec::new();
@@ -669,13 +865,9 @@ impl Interpreter {
             }
             // v0.7 字符串函数
             "str" => {
-                let s = match &args.get(0) {
-                    Some(Value::Number(n)) => format!("{}", n),
-                    Some(Value::Bool(b)) => b.to_string(),
-                    Some(Value::String(s)) => s.clone(),
-                    Some(Value::Color(r, g, b)) => format!("#{:02x}{:02x}{:02x}", r, g, b),
-                    Some(Value::None) => "none".to_string(),
-                    _ => "".to_string(),
+                let s = match args.get(0) {
+                    Some(v) => self.value_to_string(v),
+                    None => "".to_string(),
                 };
                 Value::String(s)
             }
@@ -943,7 +1135,7 @@ impl Interpreter {
                 }
                 let val = self.eval(expr, env.clone())?;
                 let (r, g, b) = match val {
-                    Value::Color(r, g, b) => (r as f32, g as f32, b as f32),
+                    Value::Color(r, g, b, _a) => (r as f32, g as f32, b as f32),
                     Value::Tuple(t) => {
                         if t.len() >= 3 {
                             (
@@ -969,6 +1161,14 @@ impl Interpreter {
             Stmt::Let(name, expr) => {
                 let val = self.eval(expr, env.clone())?;
                 env.borrow_mut().vars.insert(name.clone(), val);
+                Ok(Control::Normal)
+            }
+            // v0.9: const 不可变绑定，记录到 consts 防止后续修改
+            Stmt::ConstDef(name, expr) => {
+                let val = self.eval(expr, env.clone())?;
+                let mut env_ref = env.borrow_mut();
+                env_ref.vars.insert(name.clone(), val);
+                env_ref.consts.insert(name.clone());
                 Ok(Control::Normal)
             }
             Stmt::Assign(name, expr) => {
@@ -1105,12 +1305,14 @@ impl Interpreter {
                 let x = self.eval(x_expr, env.clone())?.as_number().unwrap_or(0.0);
                 let y = self.eval(y_expr, env.clone())?.as_number().unwrap_or(0.0);
                 let rgb_val = self.eval(rgb_expr, env.clone())?;
-                let (r, g, b) = match rgb_val {
-                    Value::Color(r, g, b) => (r as f32, g as f32, b as f32),
+                // v0.9: Color 携带 alpha，tuple 默认不透明
+                let (r, g, b, a) = match rgb_val {
+                    Value::Color(r, g, b, a) => (r as f32, g as f32, b as f32, a as f32),
                     Value::Tuple(t) => (
                         clamp_f32(t.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
                         clamp_f32(t.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
                         clamp_f32(t.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
+                        255.0,
                     ),
                     _ => {
                         let _ = self.eval_error("rgb 需要颜色或三元组")?;
@@ -1126,7 +1328,8 @@ impl Interpreter {
                     return Ok(Control::Normal);
                 }
                 if let Some(canvas) = &mut self.canvas {
-                    canvas.put_pixel(px, py, r, g, b);
+                    // v0.9: alpha < 255 时走 source-over 合成
+                    canvas.put_pixel_rgba(px, py, r, g, b, a);
                 }
                 Ok(Control::Normal)
             }
@@ -1140,11 +1343,21 @@ impl Interpreter {
                         }
                     }
                     // f32 RGBA → u8 RGB（丢弃 alpha，背景已合成）
+                    // v0.9: 线性工作流模式下，渲染时将线性值转回 sRGB
                     let mut rgb_bytes = Vec::with_capacity((canvas.width * canvas.height * 3) as usize);
                     for i in (0..canvas.pixels.len()).step_by(4) {
-                        rgb_bytes.push(clamp_u8(canvas.pixels[i] as f64));
-                        rgb_bytes.push(clamp_u8(canvas.pixels[i + 1] as f64));
-                        rgb_bytes.push(clamp_u8(canvas.pixels[i + 2] as f64));
+                        let (r, g, b) = if canvas.linear_mode {
+                            (
+                                crate::canvas::linear_to_srgb(canvas.pixels[i]) as f64,
+                                crate::canvas::linear_to_srgb(canvas.pixels[i + 1]) as f64,
+                                crate::canvas::linear_to_srgb(canvas.pixels[i + 2]) as f64,
+                            )
+                        } else {
+                            (canvas.pixels[i] as f64, canvas.pixels[i + 1] as f64, canvas.pixels[i + 2] as f64)
+                        };
+                        rgb_bytes.push(clamp_u8(r));
+                        rgb_bytes.push(clamp_u8(g));
+                        rgb_bytes.push(clamp_u8(b));
                     }
                     let img = ImageBuffer::<Rgb<u8>, _>::from_vec(
                         canvas.width,
@@ -1217,12 +1430,112 @@ impl Interpreter {
             Stmt::FieldAssign(obj, field, expr) => {
                 let obj_val = self.eval(obj, env.clone())?;
                 let val = self.eval(expr, env.clone())?;
-                if let Value::Struct(s) = obj_val {
-                    let mut s_ref = s.borrow_mut();
-                    s_ref.insert(field.clone(), val);
-                    Ok(Control::Normal)
-                } else {
-                    self.eval_error("字段赋值目标不是结构体")
+                match obj_val {
+                    Value::Struct(s) => {
+                        let mut s_ref = s.borrow_mut();
+                        s_ref.insert(field.clone(), val);
+                        Ok(Control::Normal)
+                    }
+                    // v0.9: instance 字段赋值
+                    Value::Instance(data) => {
+                        let mut d_ref = data.borrow_mut();
+                        d_ref.fields.insert(field.clone(), val);
+                        Ok(Control::Normal)
+                    }
+                    _ => self.eval_error("字段赋值目标不是结构体/实例"),
+                }
+            }
+            // v0.9: match/case 模式匹配
+            Stmt::Match(scrutinee, cases, default) => {
+                let val = self.eval(scrutinee, env.clone())?;
+                for (pattern, body) in cases {
+                    let pat_val = self.eval(pattern, env.clone())?;
+                    if val == pat_val {
+                        let child = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
+                        for sp in body {
+                            let ctrl = self.exec(sp, child.clone())?;
+                            match ctrl {
+                                Control::Normal => {}
+                                other => return Ok(other),
+                            }
+                        }
+                        return Ok(Control::Normal);
+                    }
+                }
+                // 无 case 匹配，执行 default
+                if let Some(body) = default {
+                    let child = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
+                    for sp in body {
+                        let ctrl = self.exec(sp, child.clone())?;
+                        match ctrl {
+                            Control::Normal => {}
+                            other => return Ok(other),
+                        }
+                    }
+                }
+                Ok(Control::Normal)
+            }
+            // v0.9: enum 枚举定义
+            Stmt::EnumDef(name, variants) => {
+                let mut vmap = HashMap::new();
+                for (vname, arity) in variants {
+                    vmap.insert(vname.clone(), *arity);
+                }
+                let mut env_ref = env.borrow_mut();
+                env_ref.vars.insert(name.clone(), Value::EnumDef(name.clone(), vmap));
+                Ok(Control::Normal)
+            }
+            // v0.9: class 类定义
+            Stmt::ClassDef(name, parent, fields, methods) => {
+                let mut method_map = HashMap::new();
+                for m in methods {
+                    if let Stmt::FnDef(mname, params, body) = &m.stmt {
+                        method_map.insert(mname.clone(), (params.clone(), body.clone()));
+                    }
+                }
+                let class_data = Rc::new(crate::ast::ClassData {
+                    name: name.clone(),
+                    parent: parent.clone(),
+                    fields: fields.clone(),
+                    methods: method_map,
+                });
+                self.class_defs.insert(name.clone(), class_data.clone());
+                let mut env_ref = env.borrow_mut();
+                env_ref.vars.insert(name.clone(), Value::Class(class_data));
+                Ok(Control::Normal)
+            }
+            // v0.9: module 模块定义
+            Stmt::ModuleDef(name, body) => {
+                let mod_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
+                for sp in body {
+                    let ctrl = self.exec(sp, mod_env.clone())?;
+                    match ctrl {
+                        Control::Normal => {}
+                        other => return Ok(other),
+                    }
+                }
+                let mut env_ref = env.borrow_mut();
+                env_ref.vars.insert(name.clone(), Value::Module(name.clone(), mod_env));
+                Ok(Control::Normal)
+            }
+            // v0.9: from import — 从模块导入指定项
+            Stmt::FromImport(mod_name, items) => {
+                let mod_val = env.borrow().get(mod_name);
+                match mod_val {
+                    Some(Value::Module(_, mod_env)) => {
+                        for item in items {
+                            if let Some(v) = mod_env.borrow().get(item) {
+                                env.borrow_mut().vars.insert(item.clone(), v);
+                            } else {
+                                return Err(VglError::new(
+                                    format!("模块 {} 中无此项: {}", mod_name, item),
+                                    self.current_pos,
+                                ));
+                            }
+                        }
+                        Ok(Control::Normal)
+                    }
+                    _ => Err(VglError::new(format!("{} 不是模块", mod_name), self.current_pos)),
                 }
             }
             Stmt::ExprStmt(expr) => {
@@ -1276,13 +1589,19 @@ impl Interpreter {
             .map(|e| self.eval(e, block_env.clone()).map(|v| v.as_number().unwrap_or(0.0) as i32))
             .transpose()?
             .unwrap_or(0);
+        // v0.9: join 字段支持（miter/bevel/round，仅对 polyline 有效）
+        let join = fields
+            .get("join")
+            .map(|e| self.eval(e, block_env.clone()).map(|v| v.as_string().unwrap_or_else(|| "round".to_string())))
+            .transpose()?
+            .unwrap_or_else(|| "round".to_string());
         // v0.55 批次 D：材质分支用 _mat 系列方法（逐像素 noise + alpha 集成）
         if let Some(mat_expr) = fields.get("material") {
             let mat_val = self.eval(mat_expr, block_env.clone())?;
             if let Value::Material(mat_map) = mat_val {
-                let base = mat_map.get("color").cloned().unwrap_or(Value::Color(0, 0, 0));
+                let base = mat_map.get("color").cloned().unwrap_or(Value::Color(0, 0, 0, 255));
                 let (cr, cg, cb): (f32, f32, f32) = match base {
-                    Value::Color(r, g, b) => (r as f32, g as f32, b as f32),
+                    Value::Color(r, g, b, _a) => (r as f32, g as f32, b as f32),
                     Value::Tuple(t) => (
                         clamp_f32(t.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
                         clamp_f32(t.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
@@ -1354,18 +1673,16 @@ impl Interpreter {
                                 }
                             }
                             "polyline" => {
-                                if args.len() > 1 {
-                                    for i in 0..args.len() - 1 {
-                                        let p1 = args[i].as_tuple().unwrap_or_default();
-                                        let p2 = args[i + 1].as_tuple().unwrap_or_default();
-                                        canvas.draw_line_mat(
-                                            p1.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                            p1.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                            p2.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                            p2.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                            width, &mat,
-                                        );
-                                    }
+                                // v0.9: 支持 join 字段（miter/bevel/round）
+                                let pts: Vec<(f64, f64)> = args.iter().filter_map(|v| {
+                                    let t = v.as_tuple()?;
+                                    Some((
+                                        t.get(0).and_then(|x| x.as_number()).unwrap_or(0.0),
+                                        t.get(1).and_then(|y| y.as_number()).unwrap_or(0.0),
+                                    ))
+                                }).collect();
+                                if pts.len() >= 2 {
+                                    canvas.draw_polyline_join_mat(&pts, width, &mat, &join);
                                 }
                             }
                             // v0.75 新增 Path 类型（材质分支）
@@ -1445,9 +1762,9 @@ impl Interpreter {
         }
         // 无 material 分支：保持原有逻辑（draw_line/draw_circle 传 f32 颜色，不透明）
         let (r, g, b): (f32, f32, f32) = {
-            let color_val = self.eval(fields.get("color").unwrap_or(&Expr::Color(0, 0, 0)), block_env.clone())?;
+            let color_val = self.eval(fields.get("color").unwrap_or(&Expr::Color(0, 0, 0, 255)), block_env.clone())?;
             match color_val {
-                Value::Color(r, g, b) => (r as f32, g as f32, b as f32),
+                Value::Color(r, g, b, _a) => (r as f32, g as f32, b as f32),
                 Value::Tuple(t) => (
                     clamp_f32(t.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
                     clamp_f32(t.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
@@ -1519,18 +1836,16 @@ impl Interpreter {
                         }
                     }
                     "polyline" => {
-                        if args.len() > 1 {
-                            for i in 0..args.len() - 1 {
-                                let p1 = args[i].as_tuple().unwrap_or_default();
-                                let p2 = args[i + 1].as_tuple().unwrap_or_default();
-                                canvas.draw_line(
-                                    p1.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                    p1.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                    p2.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                    p2.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                    width, r, g, b,
-                                );
-                            }
+                        // v0.9: 支持 join 字段（miter/bevel/round）
+                        let pts: Vec<(f64, f64)> = args.iter().filter_map(|v| {
+                            let t = v.as_tuple()?;
+                            Some((
+                                t.get(0).and_then(|x| x.as_number()).unwrap_or(0.0),
+                                t.get(1).and_then(|y| y.as_number()).unwrap_or(0.0),
+                            ))
+                        }).collect();
+                        if pts.len() >= 2 {
+                            draw_polyline_join(canvas, &pts, width, r, g, b, &join);
                         }
                     }
                     // v0.75 新增 Path 类型
@@ -1699,6 +2014,128 @@ impl Interpreter {
         Ok(Value::Struct(Rc::new(RefCell::new(fields))))
     }
 
+    /// v0.9: 构造 class 实例
+    pub fn construct_class(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        kwargs: &HashMap<String, Expr>,
+        env: Rc<RefCell<Env>>,
+    ) -> VglResult<Value> {
+        // 收集当前类及父链的所有字段默认值
+        let mut fields = HashMap::new();
+        self.collect_class_fields(name, &mut fields, env.clone())?;
+        // 位置参数覆盖
+        let field_names: Vec<String> = fields.keys().cloned().collect();
+        for (i, arg_expr) in args.iter().enumerate() {
+            if i < field_names.len() {
+                let val = self.eval(arg_expr, env.clone())?;
+                fields.insert(field_names[i].clone(), val);
+            } else {
+                return Err(VglError::new("class 参数过多", self.current_pos));
+            }
+        }
+        // 关键字参数覆盖
+        for (k, v_expr) in kwargs {
+            if fields.contains_key(k) {
+                let val = self.eval(v_expr, env.clone())?;
+                fields.insert(k.clone(), val);
+            } else {
+                return Err(VglError::new(format!("未知字段: {}", k), self.current_pos));
+            }
+        }
+        let instance = Value::Instance(Rc::new(RefCell::new(crate::ast::InstanceData {
+            fields,
+            class_name: name.to_string(),
+        })));
+        // 若存在 init 方法则调用
+        if let Some((params, body)) = self.lookup_method(name, "init")? {
+            self.invoke_method(&params, &body, args, kwargs, &instance, env.clone())?;
+        }
+        Ok(instance)
+    }
+
+    /// v0.9: 递归收集 class 及父类的字段（父类先，子类覆盖）
+    fn collect_class_fields(
+        &mut self,
+        name: &str,
+        fields: &mut HashMap<String, Value>,
+        env: Rc<RefCell<Env>>,
+    ) -> VglResult<()> {
+        // 先克隆类数据，避免借用冲突
+        let (parent, field_list) = if let Some(class) = self.class_defs.get(name) {
+            (class.parent.clone(), class.fields.clone())
+        } else {
+            return Ok(());
+        };
+        // 先收集父类字段
+        if let Some(ref parent) = parent {
+            self.collect_class_fields(parent, fields, env.clone())?;
+        }
+        // 再收集本类字段默认值
+        for (fname, default_expr) in &field_list {
+            let val = self.eval(default_expr, env.clone())?;
+            fields.insert(fname.clone(), val);
+        }
+        Ok(())
+    }
+
+    /// v0.9: 在类继承链中查找方法，返回 (params, body)
+    pub fn lookup_method(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> VglResult<Option<(Vec<String>, Vec<StmtWithPos>)>> {
+        let mut current = Some(class_name.to_string());
+        while let Some(cn) = current {
+            if let Some(class) = self.class_defs.get(&cn) {
+                if let Some((params, body)) = class.methods.get(method) {
+                    return Ok(Some((params.clone(), body.clone())));
+                }
+                current = class.parent.clone();
+            } else {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// v0.9: 调用方法 — 绑定 self 并执行方法体
+    pub fn invoke_method(
+        &mut self,
+        params: &[String],
+        body: &[StmtWithPos],
+        args: &[Expr],
+        kwargs: &HashMap<String, Expr>,
+        self_val: &Value,
+        env: Rc<RefCell<Env>>,
+    ) -> VglResult<Value> {
+        let method_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
+        // 绑定 self
+        method_env.borrow_mut().vars.insert("self".to_string(), self_val.clone());
+        // 绑定参数：跳过 params 中的 self，将 args 按顺序绑定
+        let mut arg_idx = 0;
+        for p in params {
+            if p == "self" {
+                continue; // self 已绑定
+            }
+            if arg_idx < args.len() {
+                let val = self.eval(&args[arg_idx], env.clone())?;
+                method_env.borrow_mut().vars.insert(p.clone(), val);
+                arg_idx += 1;
+            }
+        }
+        // 绑定关键字参数
+        for (k, v_expr) in kwargs {
+            let val = self.eval(v_expr, env.clone())?;
+            method_env.borrow_mut().vars.insert(k.clone(), val);
+        }
+        match self.execute_block(body, method_env)? {
+            Control::Return(v) => Ok(v),
+            _ => Ok(Value::None),
+        }
+    }
+
     /// v0.8 变换 & 裁剪
     pub fn apply_transform(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
         let n = |idx: usize| -> f64 {
@@ -1798,7 +2235,7 @@ impl Interpreter {
                     t[1].as_number().unwrap_or(0.0) as f32,
                     t[2].as_number().unwrap_or(0.0) as f32,
                 ),
-                Some(Value::Color(r, g, b)) => (*r as f32, *g as f32, *b as f32),
+                Some(Value::Color(r, g, b, _a)) => (*r as f32, *g as f32, *b as f32),
                 _ => (0.0, 0.0, 0.0),
             }
         };
@@ -1966,7 +2403,7 @@ impl Interpreter {
                     t[1].as_number().unwrap_or(0.0) as f32,
                     t[2].as_number().unwrap_or(0.0) as f32,
                 ),
-                Some(Value::Color(r, g, b)) => (*r as f32, *g as f32, *b as f32),
+                Some(Value::Color(r, g, b, _a)) => (*r as f32, *g as f32, *b as f32),
                 _ => (0.0, 0.0, 0.0),
             }
         };
@@ -2061,7 +2498,7 @@ impl Interpreter {
                 t[1].as_number().unwrap_or(0.0) as f32,
                 t[2].as_number().unwrap_or(0.0) as f32,
             ),
-            Some(Value::Color(r, g, b)) => (*r as f32, *g as f32, *b as f32),
+            Some(Value::Color(r, g, b, _a)) => (*r as f32, *g as f32, *b as f32),
             _ => (255.0, 255.0, 255.0),
         };
         let scale = size.max(1);
@@ -2241,7 +2678,7 @@ impl Interpreter {
                     Err(_) => Value::None,
                 };
                 let color = match result {
-                    Value::Color(r, g, b) => Some((r as f32, g as f32, b as f32)),
+                    Value::Color(r, g, b, _a) => Some((r as f32, g as f32, b as f32)),
                     Value::Tuple(ref t) if t.len() >= 3 => Some((
                         clamp_f32(t.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
                         clamp_f32(t.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),

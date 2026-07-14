@@ -8,7 +8,7 @@ use crate::error::{VglError, VglResult};
 pub enum Token {
     Number(f64),
     String(String),
-    Color(u8, u8, u8),
+    Color(u8, u8, u8, u8), // v0.9: 8 位 hex 支持 alpha 通道
     Ident(String),
     Keyword(String),
     LParen,
@@ -129,7 +129,8 @@ impl Lexer {
         // EOF 仍未闭合
         Err(VglError::new("未终止的字符串", Some(start_pos)))
     }
-    pub fn read_color(&mut self) -> VglResult<(u8, u8, u8)> {
+    pub fn read_color(&mut self) -> VglResult<(u8, u8, u8, u8)> {
+        // v0.9: 返回 (r, g, b, a)，支持 #RGB / #RRGGBB / #RGBA / #RRGGBBAA
         let start_pos = self.pos;
         self.advance(); // 跳过 #
         let start = self.pos;
@@ -145,12 +146,26 @@ impl Lexer {
             let r = u8::from_str_radix(&hex[0..2], 16).unwrap();
             let g = u8::from_str_radix(&hex[2..4], 16).unwrap();
             let b = u8::from_str_radix(&hex[4..6], 16).unwrap();
-            Ok((r, g, b))
+            Ok((r, g, b, 255))
+        } else if hex.len() == 8 {
+            // v0.9: #RRGGBBAA 8 位 hex 支持 alpha 通道
+            let r = u8::from_str_radix(&hex[0..2], 16).unwrap();
+            let g = u8::from_str_radix(&hex[2..4], 16).unwrap();
+            let b = u8::from_str_radix(&hex[4..6], 16).unwrap();
+            let a = u8::from_str_radix(&hex[6..8], 16).unwrap();
+            Ok((r, g, b, a))
         } else if hex.len() == 3 {
             let r = u8::from_str_radix(&format!("{}{}", &hex[0..1], &hex[0..1]), 16).unwrap();
             let g = u8::from_str_radix(&format!("{}{}", &hex[1..2], &hex[1..2]), 16).unwrap();
             let b = u8::from_str_radix(&format!("{}{}", &hex[2..3], &hex[2..3]), 16).unwrap();
-            Ok((r, g, b))
+            Ok((r, g, b, 255))
+        } else if hex.len() == 4 {
+            // v0.9: #RGBA 4 位 hex 支持 alpha 通道
+            let r = u8::from_str_radix(&format!("{}{}", &hex[0..1], &hex[0..1]), 16).unwrap();
+            let g = u8::from_str_radix(&format!("{}{}", &hex[1..2], &hex[1..2]), 16).unwrap();
+            let b = u8::from_str_radix(&format!("{}{}", &hex[2..3], &hex[2..3]), 16).unwrap();
+            let a = u8::from_str_radix(&format!("{}{}", &hex[3..4], &hex[3..4]), 16).unwrap();
+            Ok((r, g, b, a))
         } else {
             Err(VglError::new(format!("非法颜色 #{}", hex), Some(start_pos)))
         }
@@ -214,8 +229,8 @@ impl Lexer {
             return Ok(TokenWithPos { tok: Token::String(self.read_string()?), pos: tok_pos });
         }
         if c == '#' {
-            let (r, g, b) = self.read_color()?;
-            return Ok(TokenWithPos { tok: Token::Color(r, g, b), pos: tok_pos });
+            let (r, g, b, a) = self.read_color()?;
+            return Ok(TokenWithPos { tok: Token::Color(r, g, b, a), pos: tok_pos });
         }
         if c.is_alphabetic() || c == '_' {
             let ident = self.read_ident();
@@ -223,6 +238,8 @@ impl Lexer {
                 "canvas", "bg", "let", "for", "in", "if", "else", "fn", "return", "pixel",
                 "stroke", "render", "while", "break", "and", "or", "not", "seed", "true",
                 "false", "continue", "struct", "import", "material", "layer", "field",
+                "null", "const", "var", // v0.9: null 字面量 + const/var 绑定
+                "as", "match", "case", "default", "enum", "class", "from", "module", // v0.9: as/match/enum/class/module 关键字
             ];
             if kw.contains(&ident.as_str()) {
                 return Ok(TokenWithPos { tok: Token::Keyword(ident), pos: tok_pos });
@@ -240,12 +257,25 @@ impl Lexer {
             ':' => { self.advance(); Token::Colon }
             '.' => { self.advance(); Token::Dot }
             // v0.8: 添加 % 单字符运算符；扩展双字符识别以支持复合赋值 += -= *= /= %=
-            '+' | '-' | '*' | '/' | '=' | '<' | '>' | '!' | '%' => {
+            // v0.9: 新增位运算符 & | ^ ~ 与移位 << >>、自增自减 ++ --
+            '+' | '-' | '*' | '/' | '=' | '<' | '>' | '!' | '%' | '&' | '|' | '^' | '~' => {
                 self.advance();
                 let mut op = c.to_string();
                 if let Some(nxt) = self.peek() {
-                    // 双字符运算符：==, !=, <=, >= 以及复合赋值 +=, -=, *=, /=, %=
-                    if nxt == '=' && matches!(c, '<' | '>' | '=' | '!' | '+' | '-' | '*' | '/' | '%') {
+                    // v0.9: 双字符运算符 << >> ++ -- => （移位/自增自减/match 箭头，优先于 = 检测）
+                    let two_char = match (c, nxt) {
+                        ('<', '<') => Some("<<"),
+                        ('>', '>') => Some(">>"),
+                        ('+', '+') => Some("++"),
+                        ('-', '-') => Some("--"),
+                        ('=', '>') => Some("=>"),
+                        _ => None,
+                    };
+                    if let Some(tw) = two_char {
+                        self.advance();
+                        op = tw.to_string();
+                    } else if nxt == '=' && matches!(c, '<' | '>' | '=' | '!' | '+' | '-' | '*' | '/' | '%') {
+                        // 双字符运算符：==, !=, <=, >= 以及复合赋值 +=, -=, *=, /=, %=
                         self.advance();
                         op.push('=');
                     }

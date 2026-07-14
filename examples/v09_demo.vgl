@@ -1,0 +1,203 @@
+// v0.9 大版本演示 — 语言完整度 + 线性工作流
+// 展示：位运算符（& | ^ ~ << >>）、自增自减（++ --）、#RGBA 颜色字面量、
+//       null/const/var、as 类型转换、match/case 模式匹配、enum 枚举、
+//       class 面向对象（含继承）、from/module 模块导入、
+//       sRGB 线性工作流、stroke join（miter/bevel/round）
+
+canvas 640x480
+seed 7
+
+// ===== module 模块定义：调色板工具 =====
+module Palette {
+    const TOP = #0a1230
+    const BOT = #2a3a6e
+    // 位运算生成颜色：用 & 255 截断到字节范围，<< >> 移位组合通道
+    fn accent(n) {
+        let r = (n * 37 & 255)
+        let g = (n * 73 & 255)
+        let b = (n * 151 & 255)
+        return (r, g, b)
+    }
+}
+
+// ===== from import：从模块导入符号 =====
+from Palette import TOP, BOT, accent
+
+// ===== const / var / null 演示 =====
+const W = 640
+const H = 480
+var title = "VGL v0.9"
+let opt = null    // null 字面量（求值为 None）
+
+// ===== 开启 sRGB 线性工作流（物理正确混合）=====
+linear()
+
+// ===== 背景渐变 =====
+fill_linear_gradient(0, 0, 0, H, BOT, TOP)
+
+// ===== enum 枚举：形状类型 =====
+enum Shape {
+    Circle,
+    Square,
+    Triangle,
+    Hex
+}
+
+// ===== class 类定义 + 继承 =====
+class ShapeBase {
+    x: 0
+    y: 0
+    color: #ffffff
+    fn init(x, y, color) {
+        self.x = x
+        self.y = y
+        self.color = color
+    }
+    fn draw() {
+        // 基类默认绘制圆
+        fill_circle(self.x, self.y, 22, self.color)
+    }
+    fn area() {
+        // 位运算近似：用 << 1 代替 * 2
+        let r = 22
+        return (r * r) << 0
+    }
+}
+
+class Box : ShapeBase {
+    size: 36
+    fn init(x, y, color, size) {
+        self.x = x
+        self.y = y
+        self.color = color
+        self.size = size
+    }
+    fn draw() {
+        // 覆盖父类方法：绘制方形
+        let s = self.size
+        fill_rect(self.x - s / 2, self.y - s / 2, s, s, self.color)
+    }
+}
+
+// ===== match/case 模式匹配 =====
+fn draw_by_type(kind, x, y, color) {
+    match kind {
+        case Shape.Circle => {
+            fill_circle(x, y, 24, color)
+        }
+        case Shape.Square => {
+            fill_rect(x - 20, y - 20, 40, 40, color)
+        }
+        case Shape.Triangle => {
+            fill_polygon([(x, y - 26), (x - 22, y + 18), (x + 22, y + 18)], color)
+        }
+        case Shape.Hex => {
+            // 六边形：用位运算 << 计算索引偏移
+            let pts = [
+                (x, y - 24),
+                (x + 21, y - 12),
+                (x + 21, y + 12),
+                (x, y + 24),
+                (x - 21, y + 12),
+                (x - 21, y - 12)
+            ]
+            fill_polygon(pts, color)
+        }
+        default => {
+            fill_circle(x, y, 5, #ff0000)
+        }
+    }
+}
+
+// ===== as 类型转换 + 位运算演示 =====
+let bits = 65280          // 0xFF00
+let hi = (bits >> 8) as int    // 移位取高字节 = 255
+let lo = (bits & 255) as int  // 位与取低字节 = 0
+let mask = ~0 as int           // 位反
+let hex_color = "#3366cc" as color   // 字符串转颜色
+let flag = 1 as bool           // 数字转布尔
+let label = 42 as str          // 数字转字符串
+
+// ===== 主体绘制：形状行 + 自增 ++ =====
+let i = 0
+while i < 4 {
+    let col = accent(i + 1)
+    let sx = 90 + i * 150
+    // 用 match 分发不同形状
+    let kind = Shape.Circle
+    if i == 1 { kind = Shape.Square }
+    if i == 2 { kind = Shape.Triangle }
+    if i == 3 { kind = Shape.Hex }
+    draw_by_type(kind, sx, 130, col)
+    i++
+}
+
+// ===== class 实例化 + 方法调用 =====
+let box = Box(340, 230, accent(5), 44)
+box.draw()
+
+let base = ShapeBase(500, 230, accent(8))
+base.draw()
+
+// ===== stroke join 演示（miter/bevel/round）=====
+// miter join：尖角连接
+stroke {
+    path: path([(70, 340), (160, 300), (250, 340), (340, 300)])
+    width: 6
+    color: #66ccff
+    join: "miter"
+}
+
+// bevel join：斜角连接
+stroke {
+    path: path([(370, 340), (460, 300), (550, 340), (610, 300)])
+    width: 6
+    color: #ffcc66
+    join: "bevel"
+}
+
+// round join（默认）：圆角连接
+stroke {
+    path: path([(70, 400), (190, 380), (310, 400), (430, 380), (550, 400)])
+    width: 8
+    color: #ff66aa
+    join: "round"
+}
+
+// ===== 材质 alpha 半透明叠加（#RGBA 支持）=====
+let k = 0
+while k < 5 {
+    let c = accent(k + 12)
+    material matk {
+        color: c
+        alpha: 0.45
+        noise: 0.0
+    }
+    stroke {
+        path: circle(90 + k * 110, 440, 26)
+        width: 3
+        material: matk
+    }
+    k++
+}
+
+// ===== 位运算可视化：用 ^ 异或生成棋盘格条带 =====
+let gy = 0
+while gy < 4 {
+    let gx = 0
+    while gx < 16 {
+        // (gx ^ gy) & 1 决定明暗
+        let v = (gx ^ gy) & 1
+        let col = #224466
+        if v == 1 { col = #88ccff }
+        fill_rect(gx * 10, 360 + gy * 8, 10, 8, col)
+        gx++
+    }
+    gy++
+}
+
+// ===== 文本标题 =====
+text(210, 28, title, 3, #ffffff)
+text(210, 54, "Language Completeness", 2, #aaccff)
+
+render "v09_demo.png"

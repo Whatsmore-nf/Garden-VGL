@@ -9,6 +9,7 @@ pub struct Canvas {
     pub height: u32,
     pub pixels: Vec<f32>, // RGBA，每像素 4 个 f32，范围 [0.0, 255.0]
     pub bg: (f32, f32, f32, f32), // 背景色 RGBA，alpha 默认 255.0
+    pub linear_mode: bool, // v0.9: sRGB 线性工作流开关
 }
 
 impl Canvas {
@@ -18,6 +19,7 @@ impl Canvas {
             height: h,
             pixels: vec![0.0; (w * h * 4) as usize],
             bg: (0.0, 0.0, 0.0, 255.0),
+            linear_mode: false,
         }
     }
 
@@ -29,6 +31,7 @@ impl Canvas {
     /// 写入带 alpha 的像素，与现有像素做 source-over 合成（premultiply 方式）
     /// src=新像素，dst=现有像素
     /// v0.8：使用 premultiply 合成，修复 out_a=0 时输出非零的边界 bug
+    /// v0.9：linear_mode 开启时将源色 sRGB→linear 后再合成，保证物理正确混合
     pub fn put_pixel_rgba(&mut self, x: i32, y: i32, r: f32, g: f32, b: f32, a: f32) {
         if x < 0 || x >= self.width as i32 || y < 0 || y >= self.height as i32 {
             return;
@@ -38,6 +41,12 @@ impl Canvas {
         if sa <= 0.0 {
             return;
         }
+        // v0.9: 线性工作流模式下，将源色从 sRGB 转为线性
+        let (sr, sg, sb) = if self.linear_mode {
+            (srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b))
+        } else {
+            (r, g, b)
+        };
         let da = self.pixels[idx + 3] / 255.0;
         let out_a = sa + da * (1.0 - sa);
         if out_a <= 0.0 {
@@ -49,9 +58,9 @@ impl Canvas {
             return;
         }
         // premultiply 合成：src/dst 先乘以各自 alpha，再线性混合，最后除以 out_a 还原
-        let src_r = r * sa;
-        let src_g = g * sa;
-        let src_b = b * sa;
+        let src_r = sr * sa;
+        let src_g = sg * sa;
+        let src_b = sb * sa;
         let dst_r = self.pixels[idx] * da;
         let dst_g = self.pixels[idx + 1] * da;
         let dst_b = self.pixels[idx + 2] * da;
@@ -737,6 +746,81 @@ impl Canvas {
         }
     }
 
+    /// v0.9: 带材质的折线连接点绘制（miter/bevel/round join）
+    /// 与 draw_polyline_join 相同的 join 逻辑，线段用材质绘制；
+    /// miter/bevel 角缝用基色填充（角缝极小，材质噪声差异可忽略）
+    pub fn draw_polyline_join_mat(
+        &mut self,
+        points: &[(f64, f64)],
+        width: f64,
+        m: &MaterialParams,
+        join: &str,
+    ) {
+        if points.len() < 2 {
+            return;
+        }
+        // 先绘制每条线段（材质）
+        for i in 0..points.len() - 1 {
+            let (x0, y0) = points[i];
+            let (x1, y1) = points[i + 1];
+            self.draw_line_mat(
+                x0.round() as i32,
+                y0.round() as i32,
+                x1.round() as i32,
+                y1.round() as i32,
+                width,
+                m,
+            );
+        }
+        // round join：SDF 粗线自带圆头 cap，无需额外处理
+        if join == "round" || width <= 1.0 {
+            return;
+        }
+        // miter/bevel join：在内部连接点填充角缝（用基色）
+        let half_w = width / 2.0;
+        for i in 1..points.len() - 1 {
+            let (px, py) = points[i];
+            let (x0, y0) = points[i - 1];
+            let (x1, y1) = points[i + 1];
+            let din = ((px - x0), (py - y0));
+            let dout = ((x1 - px), (y1 - py));
+            let len_in = (din.0 * din.0 + din.1 * din.1).sqrt();
+            let len_out = (dout.0 * dout.0 + dout.1 * dout.1).sqrt();
+            if len_in < 0.001 || len_out < 0.001 {
+                continue;
+            }
+            let (nx_in, ny_in) = (-din.1 / len_in, din.0 / len_in);
+            let (nx_out, ny_out) = (-dout.1 / len_out, dout.0 / len_out);
+            if join == "miter" {
+                let mx = px + nx_in * half_w;
+                let my = py + ny_in * half_w;
+                let mx2 = px + nx_out * half_w;
+                let my2 = py + ny_out * half_w;
+                let pts = [(px as i32, py as i32), (mx as i32, my as i32), (mx2 as i32, my2 as i32)];
+                self.fill_polygon(&pts, m.r, m.g, m.b);
+                let mx3 = px - nx_in * half_w;
+                let my3 = py - ny_in * half_w;
+                let mx4 = px - nx_out * half_w;
+                let my4 = py - ny_out * half_w;
+                let pts2 = [(px as i32, py as i32), (mx3 as i32, my3 as i32), (mx4 as i32, my4 as i32)];
+                self.fill_polygon(&pts2, m.r, m.g, m.b);
+            } else if join == "bevel" {
+                let mx1 = px + nx_in * half_w;
+                let my1 = py + ny_in * half_w;
+                let mx2 = px + nx_out * half_w;
+                let my2 = py + ny_out * half_w;
+                let pts = [(px as i32, py as i32), (mx1 as i32, my1 as i32), (mx2 as i32, my2 as i32)];
+                self.fill_polygon(&pts, m.r, m.g, m.b);
+                let mx3 = px - nx_in * half_w;
+                let my3 = py - ny_in * half_w;
+                let mx4 = px - nx_out * half_w;
+                let my4 = py - ny_out * half_w;
+                let pts2 = [(px as i32, py as i32), (mx3 as i32, my3 as i32), (mx4 as i32, my4 as i32)];
+                self.fill_polygon(&pts2, m.r, m.g, m.b);
+            }
+        }
+    }
+
     /// v0.8：带材质的 SDF AA 圆轮廓
     pub fn draw_circle_mat(
         &mut self,
@@ -766,14 +850,104 @@ impl Canvas {
     }
 }
 
-/// v0.8 预留：sRGB 伽马编码（线性→sRGB），暂未集成到渲染管线
-#[allow(dead_code)]
-pub fn to_srgb(linear: f32) -> u8 {
-    let c = linear / 255.0;
+/// v0.9: sRGB→线性空间转换（f32 输入/输出，范围 [0, 255]）
+/// 用于线性工作流模式下将源色转为线性后再合成
+pub fn srgb_to_linear(srgb: f32) -> f32 {
+    let c = srgb.max(0.0).min(255.0) / 255.0;
+    let lin = if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    };
+    lin * 255.0
+}
+
+/// v0.9: 线性→sRGB 转换（f32 输入/输出，范围 [0, 255]）
+/// 用于渲染输出时将线性缓冲区转回 sRGB
+pub fn linear_to_srgb(linear: f32) -> f32 {
+    let c = linear.max(0.0).min(255.0) / 255.0;
     let srgb = if c <= 0.0031308 {
         12.92 * c
     } else {
         1.055 * c.powf(1.0 / 2.4) - 0.055
     };
-    (srgb * 255.0).clamp(0.0, 255.0) as u8
+    srgb * 255.0
+}
+
+/// v0.9: 折线连接点绘制（miter/bevel/round 三种 join）
+/// points: 折线顶点列表, width: 线宽, join: "miter"/"bevel"/"round"
+pub fn draw_polyline_join(
+    canvas: &mut Canvas,
+    points: &[(f64, f64)],
+    width: f64,
+    r: f32,
+    g: f32,
+    b: f32,
+    join: &str,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    // 先绘制每条线段
+    for i in 0..points.len() - 1 {
+        let (x0, y0) = points[i];
+        let (x1, y1) = points[i + 1];
+        if width <= 1.0 {
+            canvas.wu_line(x0.round() as i32, y0.round() as i32, x1.round() as i32, y1.round() as i32, r, g, b);
+        } else {
+            canvas.draw_thick_line_aa(x0, y0, x1, y1, width, r, g, b);
+        }
+    }
+    // round join：SDF 粗线自带圆头 cap，无需额外处理
+    if join == "round" || width <= 1.0 {
+        return;
+    }
+    // miter/bevel join：在内部连接点填充
+    let half_w = width / 2.0;
+    for i in 1..points.len() - 1 {
+        let (px, py) = points[i];
+        let (x0, y0) = points[i - 1];
+        let (x1, y1) = points[i + 1];
+        // 计算入射和出射方向
+        let din = ((px - x0), (py - y0));
+        let dout = ((x1 - px), (y1 - py));
+        let len_in = (din.0 * din.0 + din.1 * din.1).sqrt();
+        let len_out = (dout.0 * dout.0 + dout.1 * dout.1).sqrt();
+        if len_in < 0.001 || len_out < 0.001 {
+            continue;
+        }
+        let (nx_in, ny_in) = (-din.1 / len_in, din.0 / len_in);
+        let (nx_out, ny_out) = (-dout.1 / len_out, dout.0 / len_out);
+        if join == "miter" {
+            // miter: 延伸两条线段的边缘到交点
+            let mx = px + nx_in * half_w;
+            let my = py + ny_in * half_w;
+            let mx2 = px + nx_out * half_w;
+            let my2 = py + ny_out * half_w;
+            // 用三角形填充角缝
+            let pts = [(px as i32, py as i32), (mx as i32, my as i32), (mx2 as i32, my2 as i32)];
+            canvas.fill_polygon(&pts, r, g, b);
+            // 另一侧
+            let mx3 = px - nx_in * half_w;
+            let my3 = py - ny_in * half_w;
+            let mx4 = px - nx_out * half_w;
+            let my4 = py - ny_out * half_w;
+            let pts2 = [(px as i32, py as i32), (mx3 as i32, my3 as i32), (mx4 as i32, my4 as i32)];
+            canvas.fill_polygon(&pts2, r, g, b);
+        } else if join == "bevel" {
+            // bevel: 直接连接两侧边缘点
+            let mx1 = px + nx_in * half_w;
+            let my1 = py + ny_in * half_w;
+            let mx2 = px + nx_out * half_w;
+            let my2 = py + ny_out * half_w;
+            let pts = [(px as i32, py as i32), (mx1 as i32, my1 as i32), (mx2 as i32, my2 as i32)];
+            canvas.fill_polygon(&pts, r, g, b);
+            let mx3 = px - nx_in * half_w;
+            let my3 = py - ny_in * half_w;
+            let mx4 = px - nx_out * half_w;
+            let my4 = py - ny_out * half_w;
+            let pts2 = [(px as i32, py as i32), (mx3 as i32, my3 as i32), (mx4 as i32, my4 as i32)];
+            canvas.fill_polygon(&pts2, r, g, b);
+        }
+    }
 }
