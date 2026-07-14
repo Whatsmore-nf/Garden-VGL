@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=A+colorful+procedurally+generated+artwork+featuring+gradient+skyline%2C+perlin+noise+ocean%2C+rotating+windmill+silhouette+and+text+overlay+on+a+dark+blue+background%2C+digital+art+style&image_size=landscape_16_9" width="100%" alt="VGL Banner">
-</p>
-
 <h1 align="center">🍃 VGL (Visual Graphics Language)</h1>
 
 <p align="center">
