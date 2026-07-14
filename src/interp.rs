@@ -1960,8 +1960,7 @@ impl Interpreter {
 
     pub fn exec_layer(&mut self, name: &str, body: &[StmtWithPos], env: Rc<RefCell<Env>>) -> ExecResult {
         if let Some(canvas) = &self.canvas {
-            let mut layer_canvas = Canvas::new(canvas.width, canvas.height);
-            layer_canvas.fill(canvas.bg.0, canvas.bg.1, canvas.bg.2);
+            let layer_canvas = Canvas::new(canvas.width, canvas.height);
             let old_canvas = std::mem::replace(&mut self.canvas, Some(layer_canvas));
             let block_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
             let _ = self.execute_block(body, block_env);
@@ -2291,13 +2290,13 @@ impl Interpreter {
         let pixels = canvas.pixels.clone();
         match name {
             "grain" => {
-                // grain(intensity)：每像素随机扰动 ±intensity*255
-                let intensity = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.1) as f32;
+                // grain(intensity)：每像素随机扰动 ±intensity
+                let intensity = args.get(0).and_then(|v| v.as_number()).unwrap_or(5.0) as f32;
                 let mut rng = self.rng.borrow_mut();
                 for y in 0..h {
                     for x in 0..w {
                         let idx = ((y * w + x) * 4) as usize;
-                        let noise: f32 = rng.gen_range(-1.0..1.0) * intensity * 255.0;
+                        let noise: f32 = rng.gen_range(-intensity..intensity);
                         canvas.pixels[idx] = (pixels[idx] + noise).clamp(0.0, 255.0);
                         canvas.pixels[idx + 1] = (pixels[idx + 1] + noise).clamp(0.0, 255.0);
                         canvas.pixels[idx + 2] = (pixels[idx + 2] + noise).clamp(0.0, 255.0);
