@@ -37,14 +37,15 @@ pub enum Stmt {
     Let(String, Expr),
     ConstDef(String, Expr), // v0.9: const 不可变绑定
     Assign(String, Expr),
-    For(String, Expr, Expr, Vec<StmtWithPos>, Option<String>), // 最后为 label
+    For(String, Expr, Expr, Option<Expr>, Vec<StmtWithPos>, Option<String>), // v1.0: +step
     ForIn(String, Expr, Vec<StmtWithPos>, Option<String>), // v0.8 for-in-array: var, array_expr, body, label
     While(Expr, Vec<StmtWithPos>, Option<String>),
     If(Expr, Vec<StmtWithPos>, Option<Vec<StmtWithPos>>),
     Break(Option<String>), // v0.4 带标签 break
     Continue,
     Seed(u64),
-    FnDef(String, Vec<String>, Vec<StmtWithPos>),
+    FnDef(String, Vec<(String, Option<Expr>)>, Vec<StmtWithPos>), // v1.0: 默认参数
+    LetDestruct(Vec<String>, Expr), // v1.0: 元组解构 let (a, b) = expr
     Return(Expr),
     Pixel(Expr, Expr, Expr),
     Stroke(HashMap<String, Expr>),
@@ -53,7 +54,7 @@ pub enum Stmt {
     Import(String),
     MaterialDef(String, HashMap<String, Expr>),
     LayerDef(String, Vec<StmtWithPos>),
-    FieldDef(String, Vec<String>, Vec<StmtWithPos>),
+    FieldDef(String, Vec<(String, Option<Expr>)>, Vec<StmtWithPos>), // v1.0: 默认参数
     IndexAssign(Expr, Expr, Expr),
     FieldAssign(Expr, String, Expr),
     // v0.9: match/case 模式匹配 — scrutinee, cases (pattern, body), default body
@@ -93,7 +94,7 @@ pub struct ClassData {
     pub name: String,
     pub parent: Option<String>,
     pub fields: Vec<(String, Expr)>,
-    pub methods: HashMap<String, (Vec<String>, Vec<StmtWithPos>)>,
+    pub methods: HashMap<String, (Vec<(String, Option<Expr>)>, Vec<StmtWithPos>)>, // v1.0: 默认参数
 }
 
 // v0.9: 实例数据（供 Value::Instance 引用）
@@ -114,7 +115,7 @@ pub enum Value {
     Dict(Rc<RefCell<HashMap<String, Value>>>),
     Struct(Rc<RefCell<HashMap<String, Value>>>),
     Path(String, Vec<Value>),
-    Closure(String, Vec<String>, Vec<StmtWithPos>, Rc<RefCell<Env>>),
+    Closure(String, Vec<(String, Option<Expr>)>, Vec<StmtWithPos>, Rc<RefCell<Env>>), // v1.0: 默认参数
     Material(HashMap<String, Value>),
     Layer(Rc<RefCell<Canvas>>),
     Image(Rc<Canvas>), // 加载的图片，复用 Canvas 结构

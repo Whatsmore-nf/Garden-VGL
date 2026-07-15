@@ -61,7 +61,7 @@ impl Parser {
                     let mut s = self.parse_stmt()?;
                     // 注入 label
                     match &mut s.stmt {
-                        Stmt::For(_, _, _, _, l) | Stmt::ForIn(_, _, _, l) | Stmt::While(_, _, l) => {
+                        Stmt::For(_, _, _, _, _, l) | Stmt::ForIn(_, _, _, l) | Stmt::While(_, _, l) => {
                             *l = Some(label);
                         }
                         _ => {}
@@ -107,12 +107,34 @@ impl Parser {
                 }
                 "let" => {
                     self.advance();
-                    let name = match self.advance() {
-                        Token::Ident(s) => s,
-                        _ => return Err(VglError::new("let 需要标识符", Some(self.peek_pos()))),
-                    };
-                    self.expect(&Token::Op("=".to_string()))?;
-                    Ok(Stmt::Let(name, self.parse_expr()?))
+                    // v1.0: 元组解构 let (a, b, c) = expr
+                    if matches!(self.peek(), Token::LParen) {
+                        self.advance(); // 消费 (
+                        let mut names = Vec::new();
+                        if !matches!(self.peek(), Token::RParen) {
+                            loop {
+                                match self.advance() {
+                                    Token::Ident(s) => names.push(s),
+                                    _ => return Err(VglError::new("解构需要标识符", Some(self.peek_pos()))),
+                                }
+                                if matches!(self.peek(), Token::Comma) {
+                                    self.advance();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(&Token::RParen)?;
+                        self.expect(&Token::Op("=".to_string()))?;
+                        Ok(Stmt::LetDestruct(names, self.parse_expr()?))
+                    } else {
+                        let name = match self.advance() {
+                            Token::Ident(s) => s,
+                            _ => return Err(VglError::new("let 需要标识符", Some(self.peek_pos()))),
+                        };
+                        self.expect(&Token::Op("=".to_string()))?;
+                        Ok(Stmt::Let(name, self.parse_expr()?))
+                    }
                 }
                 // v0.9: var 作为 let 的别名（显式声明可变）
                 "var" => {
@@ -144,9 +166,16 @@ impl Parser {
                     let start = self.parse_expr()?;
                     // v0.8: 支持 for-in-array 遍历。若解析 expr 后遇到 .. 则为范围 for，否则为数组遍历
                     if matches!(self.peek(), Token::DotDot) {
-                        // 范围 for: for var in start..end { ... }
+                        // 范围 for: for var in start..end [step expr] { ... }
                         self.advance(); // 消费 ..
                         let end = self.parse_expr()?;
+                        // v1.0: 可选 step
+                        let step = if matches!(self.peek(), Token::Keyword(ref k) if k == "step") {
+                            self.advance();
+                            Some(self.parse_expr()?)
+                        } else {
+                            None
+                        };
                         self.expect(&Token::LBrace)?;
                         self.loop_depth += 1;
                         let mut body = Vec::new();
@@ -155,7 +184,7 @@ impl Parser {
                         }
                         self.loop_depth -= 1;
                         self.expect(&Token::RBrace)?;
-                        Ok(Stmt::For(var, start, end, body, None))
+                        Ok(Stmt::For(var, start, end, step, body, None))
                     } else {
                         // 数组遍历 for-in: for var in array_expr { ... }
                         self.expect(&Token::LBrace)?;
@@ -531,22 +560,32 @@ impl Parser {
         }
     }
 
-    pub fn parse_param_list(&mut self) -> VglResult<Vec<String>> {
+    pub fn parse_param_list(&mut self) -> VglResult<Vec<(String, Option<Expr>)>> {
         let mut params = Vec::new();
         if !matches!(self.peek(), Token::RParen) {
-            match self.advance() {
-                Token::Ident(s) => params.push(s),
-                _ => return Err(VglError::new("参数需要标识符", Some(self.peek_pos()))),
-            }
+            params.push(self.parse_one_param()?);
             while matches!(self.peek(), Token::Comma) {
                 self.advance();
-                match self.advance() {
-                    Token::Ident(s) => params.push(s),
-                    _ => return Err(VglError::new("参数需要标识符", Some(self.peek_pos()))),
-                }
+                params.push(self.parse_one_param()?);
             }
         }
         Ok(params)
+    }
+
+    /// v1.0: 解析单个参数 — Ident [= Expr]（支持默认值）
+    fn parse_one_param(&mut self) -> VglResult<(String, Option<Expr>)> {
+        let name = match self.advance() {
+            Token::Ident(s) => s,
+            _ => return Err(VglError::new("参数需要标识符", Some(self.peek_pos()))),
+        };
+        // 可选默认值: = expr
+        let default = if matches!(self.peek(), Token::Op(ref o) if o == "=") {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok((name, default))
     }
 
     pub fn parse_block_body(&mut self) -> VglResult<Vec<StmtWithPos>> {
@@ -717,31 +756,36 @@ impl Parser {
         if matches!(self.peek(), Token::RParen) {
             return Ok((args, kwargs));
         }
-        // 检测是否为 kwarg 形式: IDENT ':' 或 KEYWORD ':'
-        let is_kwarg = matches!(self.peek(), Token::Ident(_) | Token::Keyword(_))
-            && self.pos + 1 < self.tokens.len()
-            && matches!(self.tokens[self.pos + 1].tok, Token::Colon);
-        if is_kwarg {
-            while !matches!(self.peek(), Token::RParen) {
-                let key = match self.peek().clone() {
-                    Token::Ident(s) | Token::Keyword(s) => {
-                        self.advance();
-                        s
-                    }
-                    _ => return Err(VglError::new("参数名需要标识符", Some(self.peek_pos()))),
-                };
-                self.expect(&Token::Colon)?;
-                let val = self.parse_expr()?;
-                kwargs.insert(key, val);
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                }
-            }
-        } else {
+        // v1.0: 支持混合调用 — 位置参数在前，命名参数在后
+        // 检测: IDENT ':' 或 KEYWORD ':' 表示命名参数
+        let is_kwarg = |pos: usize, tokens: &[TokenWithPos]| -> bool {
+            matches!(tokens[pos].tok, Token::Ident(_) | Token::Keyword(_))
+                && pos + 1 < tokens.len()
+                && matches!(tokens[pos + 1].tok, Token::Colon)
+        };
+        // 先解析位置参数（直到遇到第一个命名参数或右括号）
+        while !matches!(self.peek(), Token::RParen) && !is_kwarg(self.pos, &self.tokens) {
             args.push(self.parse_expr()?);
-            while matches!(self.peek(), Token::Comma) {
+            if matches!(self.peek(), Token::Comma) {
                 self.advance();
-                args.push(self.parse_expr()?);
+            } else {
+                break;
+            }
+        }
+        // 然后解析命名参数（如果有）
+        while !matches!(self.peek(), Token::RParen) {
+            let key = match self.peek().clone() {
+                Token::Ident(s) | Token::Keyword(s) => {
+                    self.advance();
+                    s
+                }
+                _ => return Err(VglError::new("命名参数需要标识符", Some(self.peek_pos()))),
+            };
+            self.expect(&Token::Colon)?;
+            let val = self.parse_expr()?;
+            kwargs.insert(key, val);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
             }
         }
         Ok((args, kwargs))

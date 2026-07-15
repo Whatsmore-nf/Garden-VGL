@@ -1,7 +1,7 @@
 # VGL (Visual Graphics Language) Quick Reference
 
 > **Complete Language Definition for AI** — A minimal domain-specific language for procedural image generation
-> Version v0.9 · 2026-07-14
+> Version v1.0 · 2026-07-15
 
 ---
 
@@ -38,7 +38,7 @@ set canvas → declare background → draw content → render output
 1. Plain text source, UTF-8 encoding, extension `.vgl`
 2. Dynamic typing, runtime type tags
 3. Sequential execution, canvas as global state
-4. Positional and keyword arguments cannot be mixed
+4. Positional and keyword arguments can be mixed (v1.0) — positional first, then keyword
 
 ### Program Skeleton
 
@@ -129,6 +129,7 @@ statement =
 
 ```
 <varDecl>       ::= 'let' <ident> '=' <expr>
+<letDestruct>   ::= 'let' '(' <ident> { ',' <ident> } ')' '=' <expr>   // v1.0 tuple destructuring
 <constDecl>     ::= 'const' <ident> '=' <expr>            // immutable
 <varDeclAlt>    ::= 'var' <ident> '=' <expr>               // let alias
 <assignStmt>    ::= <ident> '=' <expr>
@@ -136,7 +137,7 @@ statement =
 <incDec>        ::= <ident> '++' | <ident> '--'            // statement level
 
 <ifStmt>        ::= 'if' <expr> '{' { <stmt> } '}' [ 'else' ( '{'{<stmt>'}' | <ifStmt> ) ]
-<forLoop>       ::= 'for' <ident> 'in' <expr> '..' <expr> '{' { <stmt> } '}'
+<forLoop>       ::= 'for' <ident> 'in' <expr> '..' <expr> [ 'step' <expr> ] '{' { <stmt> } '}'   // v1.0 step
 <whileLoop>     ::= 'while' <expr> '{' { <stmt> } '}'
 <forInLoop>     ::= 'for' <ident> 'in' <expr> '{' { <stmt> } '}'  // array/tuple
 
@@ -144,6 +145,9 @@ statement =
 <continueStmt>  ::= 'continue'
 
 <fnDecl>        ::= 'fn' <ident> '(' [ <params> ] ')' '{' { <stmt> } '}'
+<params>        ::= <param> { ',' <param> }
+<param>         ::= <ident> [ '=' <expr> ]                // v1.0 default value
+<callArgs>      ::= [ <expr> { ',' <expr> } ] { <ident> ':' <expr> }   // v1.0 positional then keyword
 <returnStmt>    ::= 'return' <expr>
 
 <matchStmt>     ::= 'match' <expr> '{' { <case> } [ 'default' '=>' '{' <stmts> '}' ] '}'
@@ -292,6 +296,11 @@ for x in 0..256 {                  // [0, 256), step 1
     pixel(x: x, y: y, rgb: ...)
 }
 
+// Range for-loop with custom step (v1.0)
+for x in 0..256 step 4 {           // [0, 256), step 4
+    fill_rect(x, 0, 4, 4, #ffffff)
+}
+
 // Labeled for (for breaking outer loop)
 outer: for i in 0..10 {
     for j in 0..10 {
@@ -358,6 +367,19 @@ match color {
 fn add(a, b) {
     return a + b
 }
+
+// Default parameter values (v1.0)
+fn draw_dot(x, y, r = 5, fill = color(255, 255, 255)) {
+    fill_circle(x, y, r, fill)
+}
+draw_dot(100, 100)                       // all defaults
+draw_dot(100, 100, 10)                   // positional override
+draw_dot(100, 100, fill: #ff0000)        // keyword argument (use ':' not '=')
+draw_dot(100, 100, 8, fill: #00ff00)     // mix: positional first, then keyword
+// NOTE: keyword names must match parameter names, otherwise a runtime error is raised
+
+// Tuple destructuring (v1.0)
+let (h, s, l) = rgb_to_hsl(255, 100, 50)
 
 // Closures (capture outer variables)
 fn make_counter() {
@@ -524,6 +546,7 @@ fbm(x, y, octaves)         → [-1, 1] fractal Brownian motion
 ### 7.4 Color
 
 ```
+color(r, g, b [, a])       → construct color (r,g,b,a); alpha defaults to 255 (v1.0)
 rgb_to_hsl(r, g, b)        → (h, s, l) tuple
 hsl_to_rgb(h, s, l)        → (r, g, b) tuple
 lerp_color(c1, c2, t)      → color interpolation
@@ -556,6 +579,8 @@ find(s, sub)               → returns index or -1
 ```
 load(path)                 → image object
 pixel_at(img, x, y)        → (r, g, b) read pixel
+width()                    → canvas width in pixels (v1.0)
+height()                   → canvas height in pixels (v1.0)
 compose(name, blend)       → layer compositing (side effect)
 fill(name)                 → color field fill (side effect)
 ```
@@ -918,7 +943,7 @@ render "oop_demo.png"
 canvas  bg  let  const  var  for  in  if  else  fn  return
 pixel  stroke  render  while  break  continue  and  or  not
 seed  true  false  null  struct  import  material  layer  field
-as  match  case  default  enum  class  from  module
+as  match  case  default  enum  class  from  module  step
 ```
 
-All keywords are lowercase. As of v0.9, all reserved words are implemented.
+All keywords are lowercase. As of v1.0, all reserved words are implemented.

@@ -1,0 +1,115 @@
+// ============================================================
+// palette.vgl — 语义化调色板工具库
+// 提供色彩提取、调和、梯度生成等高级函数
+// 用法: import "lib/palette.vgl"
+// v1.0: 默认参数 + color() 构造器 + for 循环
+// ============================================================
+
+module Palette {
+
+// 在两个颜色之间生成渐变序列
+fn gradient(c1, c2, steps = 5) {
+    let arr = array()
+    for i in 0..steps {
+        let t = i / (steps - 1)
+        push(arr, lerp_color(c1, c2, t))
+    }
+    return arr
+}
+
+// 三色渐变
+fn gradient3(c1, c2, c3, steps = 5) {
+    let arr = array()
+    for i in 0..steps {
+        let t = i / (steps - 1)
+        if t < 0.5 {
+            push(arr, lerp_color(c1, c2, t * 2))
+        } else {
+            push(arr, lerp_color(c2, c3, (t - 0.5) * 2))
+        }
+    }
+    return arr
+}
+
+// 互补色
+fn complementary(base) {
+    let (h, s, l) = rgb_to_hsl(base[0], base[1], base[2])
+    let comp_h = (h + 180) % 360
+    let comp = hsl_to_rgb(comp_h, s, l)
+    return [base, comp]
+}
+
+// 类似色：返回 N 个相邻色
+fn analogous(base, count = 5) {
+    let arr = array()
+    let (h, s, l) = rgb_to_hsl(base[0], base[1], base[2])
+    for i in 0..count {
+        let hue = (h + (i - count / 2) * 30 + 360) % 360
+        push(arr, hsl_to_rgb(hue, s, l))
+    }
+    return arr
+}
+
+// 三色组
+fn triadic(base) {
+    let (h, s, l) = rgb_to_hsl(base[0], base[1], base[2])
+    let c2 = hsl_to_rgb((h + 120) % 360, s, l)
+    let c3 = hsl_to_rgb((h + 240) % 360, s, l)
+    return [base, c2, c3]
+}
+
+// 明度梯度
+fn value_ramp(base, count = 5) {
+    let arr = array()
+    let (h, s, l) = rgb_to_hsl(base[0], base[1], base[2])
+    for i in 0..count {
+        let lightness = 0.15 + (i / (count - 1)) * 0.7
+        push(arr, hsl_to_rgb(h, s, lightness))
+    }
+    return arr
+}
+
+// 饱和度梯度
+fn saturation_ramp(base, count = 5) {
+    let arr = array()
+    let (h, s, l) = rgb_to_hsl(base[0], base[1], base[2])
+    for i in 0..count {
+        let sat = (i / (count - 1)) * s
+        push(arr, hsl_to_rgb(h, sat, l))
+    }
+    return arr
+}
+
+// ---- 预设调色板 ----
+
+fn sunset() {
+    return [color(255, 94, 58), color(255, 154, 0), color(255, 206, 84), color(255, 236, 142), color(142, 96, 200)]
+}
+
+fn ocean() {
+    return [color(10, 25, 47), color(27, 56, 94), color(46, 94, 137), color(82, 142, 174), color(150, 205, 222)]
+}
+
+fn forest_pal() {
+    return [color(20, 40, 30), color(34, 72, 48), color(74, 107, 62), color(126, 148, 82), color(180, 176, 132)]
+}
+
+fn lavender() {
+    return [color(45, 27, 78), color(99, 65, 120), color(157, 108, 171), color(205, 164, 215), color(238, 221, 242)]
+}
+
+fn flame() {
+    return [color(50, 12, 5), color(120, 20, 10), color(200, 50, 0), color(240, 120, 30), color(255, 210, 100)]
+}
+
+fn nightsky() {
+    return [color(5, 5, 20), color(15, 20, 50), color(30, 40, 80), color(60, 80, 130), color(130, 160, 200)]
+}
+
+// 从调色板中按索引取色（自动循环）
+fn pick(palette, index) {
+    let n = len(palette)
+    return palette[index % n]
+}
+
+} // end module Palette

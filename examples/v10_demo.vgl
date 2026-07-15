@@ -1,0 +1,166 @@
+// v1.0 大版本演示 — 语义化程序化生成
+// 展示：默认参数、混合位置+命名参数调用、kwargs 校验、
+//       元组解构 let (a, b) = expr、color() 语义化构造器、
+//       for x in 0..n step k { } 循环
+// 哲学：代码是"活的生成蓝图"，而非"死的像素快照"
+
+canvas 640x480
+seed 42
+
+// ============================================================
+// 1. color() 语义化颜色构造器
+//    替代裸元组 (r, g, b)，让颜色意图一目了然
+// ============================================================
+let bg_dark = color(10, 15, 30)
+let bg_light = color(60, 40, 80)
+let accent_warm = color(255, 180, 80)
+let accent_cool = color(80, 180, 255)
+
+// 背景：线性渐变
+fill_linear_gradient(0, 0, 0, 480, bg_dark, bg_light)
+
+// ============================================================
+// 2. 默认参数 + 命名参数调用
+//    函数定义时可指定默认值，调用时可按名传参
+// ============================================================
+
+// 定义带默认参数的函数
+fn draw_glow(x, y, radius = 20, color = color(255, 200, 100), intensity = 0.6) {
+    // 外层光晕
+    fill_radial_gradient(x, y, radius * 3, color, darken(color, 0.8))
+    // 中层
+    material mid_mat {
+        color: color
+        alpha: intensity * 0.5
+        noise: 0.0
+    }
+    stroke {
+        path: circle(x, y, radius * 1.8)
+        width: radius
+        material: mid_mat
+    }
+    // 内核
+    fill_radial_gradient(x, y, radius * 0.5, brighten(color, 0.5), color)
+}
+
+// 调用方式 1：全部使用默认参数
+draw_glow(100, 100)
+
+// 调用方式 2：覆盖部分默认参数（命名参数）
+draw_glow(300, 100, color: accent_cool)
+
+// 调用方式 3：混合位置 + 命名参数
+draw_glow(500, 100, 15, color: accent_warm, intensity: 0.8)
+
+// 调用方式 4：全部命名参数（最清晰）
+draw_glow(x: 200, y: 250, radius: 30, color: color(200, 100, 255), intensity: 0.7)
+
+// ============================================================
+// 3. 元组解构：let (a, b, c) = expr
+//    从函数返回值或元组中一次性提取多个变量
+// ============================================================
+
+// HSL 转换返回三元组，用解构一次性提取
+fn rgb_info(c) {
+    let (h, s, l) = rgb_to_hsl(c[0], c[1], c[2])
+    return (h, s, l)
+}
+
+let base = color(100, 150, 200)
+let (hue, sat, light) = rgb_info(base)
+
+// 用解构后的值做颜色操作
+let comp_h = (hue + 180) % 360
+let comp_color = hsl_to_rgb(comp_h, sat, light)
+
+// 画互补色对比
+fill_rect(50, 300, 80, 60, base)
+fill_rect(140, 300, 80, 60, comp_color)
+text(55, 370, "base", 2, color(255, 255, 255))
+text(145, 370, "comp", 2, color(255, 255, 255))
+
+// ============================================================
+// 4. for step 循环：跳步迭代
+//    for x in 0..n step k { } — 比 while + 手动递增更语义化
+// ============================================================
+
+// 棋盘格：step 跳过格子
+for y in 0..400 step 40 {
+    for x in 250..620 step 40 {
+        let gx = (x / 40) as int
+        let gy = ((y - 200) / 40) as int
+        if (gx + gy) % 2 == 0 {
+            fill_rect(x, y, 38, 38, color(40, 30, 60))
+        } else {
+            fill_rect(x, y, 38, 38, color(60, 50, 80))
+        }
+    }
+}
+
+// 放射状光线：step 控制光线密度
+let cx = 480
+let cy = 100
+for angle in 0..628 step 20 {
+    let rad = angle / 100
+    let dx = cos(rad) * 200
+    let dy = sin(rad) * 200
+    stroke {
+        path: line(cx, cy, cx + dx, cy + dy)
+        width: 2
+        color: color(255, 200, 100, 30)
+    }
+}
+
+// ============================================================
+// 5. 综合演示：用所有新特性编写语义化生成器
+// ============================================================
+
+// 带默认参数的粒子生成器
+fn particle_system(cx, cy, count = 50, spread = 100, col = color(255, 255, 200), size_range = 3.0) {
+    for i in 0..count {
+        let angle = (i / count) * 6.28318
+        let dist = rand(0, spread)
+        let px = cx + cos(angle) * dist
+        let py = cy + sin(angle) * dist
+        let r = rand(0.5, size_range)
+        let b = rand(0.4, 1.0)
+        // 用 color() 构造粒子颜色（参数名用 col 避免遮蔽内置 color() 函数）
+        fill_circle(px, py, r, color(col[0] * b, col[1] * b, col[2] * b))
+    }
+}
+
+// 用默认参数生成暖色粒子
+particle_system(100, 400)
+
+// 覆盖默认参数：冷色粒子
+particle_system(400, 400, count: 30, col: accent_cool, size_range: 5.0)
+
+// 全部命名参数
+particle_system(cx: 560, cy: 400, count: 40, spread: 80, col: color(255, 100, 200), size_range: 4.0)
+
+// ============================================================
+// 6. for step + 解构组合：色环
+// ============================================================
+let ring_cx = 320
+let ring_cy = 240
+let ring_r = 60
+
+for angle in 0..360 step 15 {
+    let rad = radians(angle)
+    let px = ring_cx + cos(rad) * ring_r
+    let py = ring_cy + sin(rad) * ring_r
+    // color() 构造 HSL 色环
+    let col = hsl_to_rgb(angle, 0.8, 0.5)
+    let (h, s, l) = rgb_to_hsl(col[0], col[1], col[2])
+    fill_circle(px, py, 8, hsl_to_rgb(h, s, l))
+}
+
+// 中心标题
+text(250, 30, "VGL v1.0", 3, color(255, 255, 255))
+text(220, 55, "Semantic Generation", 2, color(200, 200, 255))
+
+// 后处理
+vignette(0.3, 0.8)
+grain(0.02, 1.0)
+
+render "v10_demo.png"

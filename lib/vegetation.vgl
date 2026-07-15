@@ -1,0 +1,119 @@
+// ============================================================
+// vegetation.vgl — 语义化植被生成库
+// 树木、花朵、灌木、森林
+// 用法: import "lib/vegetation.vgl"
+// v1.0: 默认参数 + color() + for 循环
+// ============================================================
+
+module Vegetation {
+
+// 树：分形树干 + 冠层
+fn tree(x, y, scale = 1.0, trunk_color = color(60, 40, 20), leaf_color = color(40, 80, 30)) {
+    let trunk_h = 40 * scale
+    let trunk_w = 6 * scale
+    fill_polygon(
+        [(x - trunk_w * 0.6, y), (x + trunk_w * 0.6, y), (x + trunk_w * 0.3, y - trunk_h), (x - trunk_w * 0.3, y - trunk_h)],
+        trunk_color
+    )
+    let crown_y = y - trunk_h
+    let crown_r = 25 * scale
+    for i in 0..5 {
+        let angle = (i / 5) * 6.28318
+        let bx = x + cos(angle) * crown_r * 0.5
+        let by = crown_y + sin(angle) * crown_r * 0.3
+        let shade = 0.8 + perlin(i * 3.7, 0) * 0.4
+        fill_circle(bx, by, crown_r * (0.7 + perlin(i * 2.3, 10) * 0.3), (leaf_color[0] * shade, leaf_color[1] * shade, leaf_color[2] * shade))
+    }
+    fill_circle(x - crown_r * 0.3, crown_y - crown_r * 0.2, crown_r * 0.4, brighten(leaf_color, 0.2))
+}
+
+// 松树
+fn pine(x, y, scale = 1.0, trunk_color = color(60, 40, 20), leaf_color = color(20, 50, 25)) {
+    let trunk_h = 20 * scale
+    let trunk_w = 4 * scale
+    fill_rect(x - trunk_w / 2, y - trunk_h, trunk_w, trunk_h, trunk_color)
+    let base_y = y - trunk_h
+    for i in 0..3 {
+        let layer_y = base_y - i * 18 * scale
+        let layer_w = (30 - i * 6) * scale
+        let layer_h = 25 * scale
+        let shade = 0.85 + i * 0.05
+        fill_polygon(
+            [(x, layer_y - layer_h), (x - layer_w / 2, layer_y), (x + layer_w / 2, layer_y)],
+            (leaf_color[0] * shade, leaf_color[1] * shade, leaf_color[2] * shade)
+        )
+    }
+}
+
+// 秋树
+fn autumn_tree(x, y, scale = 1.0, trunk_color = color(60, 40, 20)) {
+    tree(x, y, scale, trunk_color, color(200, 100, 30))
+    for i in 0..8 {
+        let lx = x + rand(-40, 40)
+        let ly = y + rand(-10, 30)
+        let col = rand(0, 1)
+        if col < 0.33 {
+            fill_circle(lx, ly, rand(1, 3), color(200, 80, 20))
+        } else if col < 0.66 {
+            fill_circle(lx, ly, rand(1, 3), color(220, 140, 40))
+        } else {
+            fill_circle(lx, ly, rand(1, 3), color(180, 60, 60))
+        }
+    }
+}
+
+// 灌木
+fn bush(x, y, scale = 1.0, color = color(30, 60, 25)) {
+    let r = 15 * scale
+    for i in 0..4 {
+        let bx = x + rand(-r * 0.5, r * 0.5)
+        let by = y + rand(-r * 0.3, r * 0.3)
+        let br = r * (0.6 + perlin(i * 2.1, 0) * 0.4)
+        let shade = 0.8 + perlin(i * 1.7, 5) * 0.3
+        fill_circle(bx, by, br, (color[0] * shade, color[1] * shade, color[2] * shade))
+    }
+}
+
+// 花
+fn flower(x, y, scale = 1.0, petal_color = color(255, 100, 100), center_color = color(255, 220, 50)) {
+    let petal_r = 4 * scale
+    for i in 0..5 {
+        let angle = (i / 5) * 6.28318
+        let px = x + cos(angle) * petal_r
+        let py = y + sin(angle) * petal_r
+        fill_circle(px, py, petal_r, petal_color)
+    }
+    fill_circle(x, y, petal_r * 0.6, center_color)
+    stroke {
+        path: line(x, y + petal_r, x, y + petal_r + 15 * scale)
+        width: 1 * scale
+        color: color(40, 100, 40)
+    }
+}
+
+// 花丛
+fn flowerbed(x, y, w, count = 10, palette = [color(255, 100, 100), color(255, 200, 100), color(200, 100, 255)]) {
+    for i in 0..count {
+        let fx = x + rand(0, w)
+        let fy = y + rand(-5, 5)
+        let scale = rand(0.5, 1.2)
+        let col = palette[rand(0, len(palette)) % len(palette)]
+        flower(fx, fy, scale, col, color(255, 220, 50))
+    }
+}
+
+// 森林
+fn forest_scene(y_base, rows = 3, tree_palette = [color(30, 60, 25), color(40, 80, 30), color(50, 70, 20)], trunk_color = color(60, 40, 20)) {
+    let w = width()
+    for i in 0..rows {
+        let row_y = y_base + i * 30
+        let tree_count = rand(3, 6) as int
+        for j in 0..tree_count {
+            let tx = rand(0, w)
+            let scale = 0.5 + (i / rows) * 1.0
+            tree(tx, row_y, scale, trunk_color, tree_palette[j % len(tree_palette)])
+        }
+    }
+}
+
+} // end module Vegetation

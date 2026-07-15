@@ -1,7 +1,7 @@
 # VGL（Visual Graphics Language）快速参考
 
 > **面向 AI 的完整语言定义** — 用于程序化生成图像的最小领域专用语言
-> 版本 v0.9 · 2026-07-14
+> 版本 v1.0 · 2026-07-15
 
 ---
 
@@ -38,7 +38,7 @@ VGL 是一种面向程序化图像生成的领域特定脚本语言。一个 VGL
 1. 纯文本源码，UTF-8 编码，扩展名 `.vgl`
 2. 动态类型，运行时携带类型标签
 3. 顺序执行，画布为全局状态
-4. 位置参数与关键字参数不可混用
+4. 位置参数与关键字参数可混用（v1.0）——位置参数在前，关键字参数在后
 
 ### 程序骨架
 
@@ -129,6 +129,7 @@ render "output.png"     // 必须：输出为 PNG 文件
 
 ```
 <变量声明>      ::= 'let' <标识符> '=' <表达式>
+<元组解构>      ::= 'let' '(' <标识符> { ',' <标识符> } ')' '=' <表达式>   // v1.0 元组解构
 <常量声明>      ::= 'const' <标识符> '=' <表达式>        // 不可修改
 <可变声明>      ::= 'var' <标识符> '=' <表达式>           // let 别名
 <赋值语句>      ::= <标识符> '=' <表达式>
@@ -136,7 +137,7 @@ render "output.png"     // 必须：输出为 PNG 文件
 <自增自减>      ::= <标识符> '++' | <标识符> '--'        // 语句级
 
 <if 语句>       ::= 'if' <表达式> '{' { <语句> } '}' [ 'else' ( '{'{<语句>'}' | <if 语句> ) ]
-<for 循环>      ::= 'for' <标识符> 'in' <表达式> '..' <表达式> '{' { <语句> } '}'
+<for 循环>      ::= 'for' <标识符> 'in' <表达式> '..' <表达式> [ 'step' <表达式> ] '{' { <语句> } '}'   // v1.0 step
 <while 循环>    ::= 'while' <表达式> '{' { <语句> } '}'
 <for-in 遍历>   ::= 'for' <标识符> 'in' <表达式> '{' { <语句> } '}'   // 遍历数组/元组
 
@@ -144,6 +145,9 @@ render "output.png"     // 必须：输出为 PNG 文件
 <continue>      ::= 'continue'
 
 <函数定义>      ::= 'fn' <标识符> '(' [ <参数列表> ] ')' '{' { <语句> } '}'
+<参数列表>      ::= <参数> { ',' <参数> }
+<参数>          ::= <标识符> [ '=' <表达式> ]                // v1.0 默认参数值
+<调用实参>      ::= [ <表达式> { ',' <表达式> } ] { <标识符> ':' <表达式> }   // v1.0 先位置后命名
 <return>        ::= 'return' <表达式>
 
 <match 语句>    ::= 'match' <表达式> '{' { <case> } [ 'default' '=>' '{' <语句块> '}' ] '}'
@@ -292,6 +296,11 @@ for x in 0..256 {                  // [0, 256) 步长 1
     pixel(x: x, y: y, rgb: ...)
 }
 
+// 带 step 的范围 for 循环（v1.0）
+for x in 0..256 step 4 {           // [0, 256) 步长 4
+    fill_rect(x, 0, 4, 4, #ffffff)
+}
+
 // 带标签的 for（用于 break 跳出外层）
 outer: for i in 0..10 {
     for j in 0..10 {
@@ -358,6 +367,19 @@ match color {
 fn add(a, b) {
     return a + b
 }
+
+// 默认参数值（v1.0）
+fn draw_dot(x, y, r = 5, fill = color(255, 255, 255)) {
+    fill_circle(x, y, r, fill)
+}
+draw_dot(100, 100)                       // 全部使用默认值
+draw_dot(100, 100, 10)                   // 位置参数覆盖
+draw_dot(100, 100, fill: #ff0000)        // 命名参数（用 ':' 而非 '='）
+draw_dot(100, 100, 8, fill: #00ff00)     // 混合：位置参数在前，命名参数在后
+// 注意：命名参数名必须与形参名一致，否则触发运行时错误
+
+// 元组解构（v1.0）
+let (h, s, l) = rgb_to_hsl(255, 100, 50)
 
 // 闭包（捕获外层变量）
 fn make_counter() {
@@ -524,6 +546,7 @@ fbm(x, y, octaves)         → [-1, 1] 分形布朗运动
 ### 7.4 颜色
 
 ```
+color(r, g, b [, a])       → 构造颜色 (r,g,b,a)；alpha 默认 255（v1.0）
 rgb_to_hsl(r, g, b)        → (h, s, l) 元组
 hsl_to_rgb(h, s, l)        → (r, g, b) 元组
 lerp_color(c1, c2, t)      → 颜色插值
@@ -556,6 +579,8 @@ find(s, sub)               → 返回索引或 -1
 ```
 load(path)                 → image 对象
 pixel_at(img, x, y)        → (r, g, b) 读取像素
+width()                    → 画布宽度（像素）（v1.0）
+height()                   → 画布高度（像素）（v1.0）
 compose(name, blend)       → 图层合成（副作用）
 fill(name)                 → 颜色场填充（副作用）
 ```
@@ -918,7 +943,7 @@ render "oop_demo.png"
 canvas  bg  let  const  var  for  in  if  else  fn  return
 pixel  stroke  render  while  break  continue  and  or  not
 seed  true  false  null  struct  import  material  layer  field
-as  match  case  default  enum  class  from  module
+as  match  case  default  enum  class  from  module  step
 ```
 
-全部关键字均为小写，v0.9 起所有保留字均已实现。
+全部关键字均为小写，v1.0 起所有保留字均已实现。

@@ -606,12 +606,29 @@ impl Interpreter {
         // 用户函数 / 闭包
         if let Some(Value::Closure(_, params, body, closure_env)) = env.borrow().get(name) {
             let new_env = Rc::new(RefCell::new(Env::new(Some(closure_env.clone()))));
-            for (i, p) in params.iter().enumerate() {
-                if i < args.len() {
-                    new_env.borrow_mut().vars.insert(p.clone(), arg_vals[i].clone());
+            // v1.0: 1. 先应用默认值（在闭包定义环境中求值）
+            for (pname, default) in params.iter() {
+                if let Some(def_expr) = default {
+                    let dv = self.eval(def_expr, closure_env.clone())?;
+                    new_env.borrow_mut().vars.insert(pname.clone(), dv);
                 }
             }
+            // 2. 应用位置参数（覆盖默认值）
+            for (i, (pname, _)) in params.iter().enumerate() {
+                if i < args.len() {
+                    new_env.borrow_mut().vars.insert(pname.clone(), arg_vals[i].clone());
+                }
+            }
+            // 3. 应用命名参数（覆盖默认值和位置参数）+ v1.0 参数名校验
+            let param_names: std::collections::HashSet<&str> =
+                params.iter().map(|(n, _)| n.as_str()).collect();
             for (k, v) in kwargs {
+                if !param_names.contains(k.as_str()) {
+                    return Err(VglError::new(
+                        format!("函数 {} 没有参数 '{}'", name, k),
+                        self.current_pos,
+                    ));
+                }
                 new_env.borrow_mut().vars.insert(k.clone(), self.eval(v, env.clone())?);
             }
             match self.execute_block(&body, new_env)? {
@@ -1113,6 +1130,21 @@ impl Interpreter {
                     _ => return Err(VglError::new("pixel_at 需要 image 参数", self.current_pos)),
                 }
             }
+            // v1.0: 画布尺寸查询（语义化标准库依赖）
+            "width" => {
+                Value::Number(self.canvas.as_ref().map(|c| c.width as f64).unwrap_or(0.0))
+            }
+            "height" => {
+                Value::Number(self.canvas.as_ref().map(|c| c.height as f64).unwrap_or(0.0))
+            }
+            // v1.0: color() 语义化颜色构造器
+            "color" => {
+                let r = num!(0);
+                let g = num!(1);
+                let b = num!(2);
+                let a = args.get(3).and_then(|v| v.as_number()).unwrap_or(255.0);
+                Value::Tuple(vec![Value::Number(r), Value::Number(g), Value::Number(b), Value::Number(a)])
+            }
             _ => return Ok(None),
         };
         Ok(Some(v))
@@ -1163,6 +1195,26 @@ impl Interpreter {
                 env.borrow_mut().vars.insert(name.clone(), val);
                 Ok(Control::Normal)
             }
+            // v1.0: 元组解构 let (a, b, c) = expr
+            Stmt::LetDestruct(names, expr) => {
+                let val = self.eval(expr, env.clone())?;
+                let items = match &val {
+                    Value::Tuple(t) => t.clone(),
+                    Value::Array(arr) => arr.borrow().clone(),
+                    _ => return Err(VglError::new(
+                        format!("解构需要元组或数组，得到 {:?}", val),
+                        self.current_pos,
+                    )),
+                };
+                for (i, name) in names.iter().enumerate() {
+                    if let Some(v) = items.get(i) {
+                        env.borrow_mut().vars.insert(name.clone(), v.clone());
+                    } else {
+                        env.borrow_mut().vars.insert(name.clone(), Value::None);
+                    }
+                }
+                Ok(Control::Normal)
+            }
             // v0.9: const 不可变绑定，记录到 consts 防止后续修改
             Stmt::ConstDef(name, expr) => {
                 let val = self.eval(expr, env.clone())?;
@@ -1178,9 +1230,14 @@ impl Interpreter {
                 }
                 Ok(Control::Normal)
             }
-            Stmt::For(var, start, end, body, label) => {
+            Stmt::For(var, start, end, step, body, label) => {
                 let start_val = self.eval(start, env.clone())?;
                 let end_val = self.eval(end, env.clone())?;
+                let step_val = if let Some(se) = step {
+                    self.eval(se, env.clone())?.as_number().unwrap_or(1.0)
+                } else {
+                    1.0
+                };
                 let mut i = start_val.as_number().unwrap_or(0.0);
                 let end = end_val.as_number().unwrap_or(0.0);
                 while i < end {
@@ -1191,7 +1248,6 @@ impl Interpreter {
                         Control::Continue => {}
                         Control::Break(None) => break,
                         Control::Break(Some(l)) => {
-                            // 匹配 label：若匹配则终止本循环，否则向上传播
                             if label.as_deref() == Some(l.as_str()) {
                                 break;
                             } else {
@@ -1200,7 +1256,7 @@ impl Interpreter {
                         }
                         Control::Return(v) => return Ok(Control::Return(v)),
                     }
-                    i += 1.0;
+                    i += step_val;
                 }
                 Ok(Control::Normal)
             }
@@ -2084,7 +2140,7 @@ impl Interpreter {
         &self,
         class_name: &str,
         method: &str,
-    ) -> VglResult<Option<(Vec<String>, Vec<StmtWithPos>)>> {
+    ) -> VglResult<Option<(Vec<(String, Option<Expr>)>, Vec<StmtWithPos>)>> {
         let mut current = Some(class_name.to_string());
         while let Some(cn) = current {
             if let Some(class) = self.class_defs.get(&cn) {
@@ -2100,9 +2156,10 @@ impl Interpreter {
     }
 
     /// v0.9: 调用方法 — 绑定 self 并执行方法体
+    /// v1.0: 支持默认参数 + kwargs 校验
     pub fn invoke_method(
         &mut self,
-        params: &[String],
+        params: &[(String, Option<Expr>)],
         body: &[StmtWithPos],
         args: &[Expr],
         kwargs: &HashMap<String, Expr>,
@@ -2112,20 +2169,38 @@ impl Interpreter {
         let method_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
         // 绑定 self
         method_env.borrow_mut().vars.insert("self".to_string(), self_val.clone());
-        // 绑定参数：跳过 params 中的 self，将 args 按顺序绑定
+        // v1.0: 1. 先应用默认值
+        for (pname, default) in params.iter() {
+            if pname == "self" {
+                continue;
+            }
+            if let Some(def_expr) = default {
+                let dv = self.eval(def_expr, env.clone())?;
+                method_env.borrow_mut().vars.insert(pname.clone(), dv);
+            }
+        }
+        // 2. 绑定位置参数（跳过 self）
         let mut arg_idx = 0;
-        for p in params {
-            if p == "self" {
-                continue; // self 已绑定
+        for (pname, _) in params.iter() {
+            if pname == "self" {
+                continue;
             }
             if arg_idx < args.len() {
                 let val = self.eval(&args[arg_idx], env.clone())?;
-                method_env.borrow_mut().vars.insert(p.clone(), val);
+                method_env.borrow_mut().vars.insert(pname.clone(), val);
                 arg_idx += 1;
             }
         }
-        // 绑定关键字参数
+        // 3. 绑定命名参数 + 校验
+        let param_names: std::collections::HashSet<&str> =
+            params.iter().map(|(n, _)| n.as_str()).collect();
         for (k, v_expr) in kwargs {
+            if !param_names.contains(k.as_str()) {
+                return Err(VglError::new(
+                    format!("方法没有参数 '{}'", k),
+                    self.current_pos,
+                ));
+            }
             let val = self.eval(v_expr, env.clone())?;
             method_env.borrow_mut().vars.insert(k.clone(), val);
         }
@@ -2666,10 +2741,10 @@ impl Interpreter {
             for x in 0..w {
                 let call_env = Rc::new(RefCell::new(Env::new(Some(def_env.clone()))));
                 if !params.is_empty() {
-                    call_env.borrow_mut().vars.insert(params[0].clone(), Value::Number(x as f64));
+                    call_env.borrow_mut().vars.insert(params[0].0.clone(), Value::Number(x as f64));
                 }
                 if params.len() > 1 {
-                    call_env.borrow_mut().vars.insert(params[1].clone(), Value::Number(y as f64));
+                    call_env.borrow_mut().vars.insert(params[1].0.clone(), Value::Number(y as f64));
                 }
                 let result = match self.execute_block(&body, call_env) {
                     Ok(Control::Return(v)) => v,

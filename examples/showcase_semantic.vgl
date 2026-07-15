@@ -1,0 +1,95 @@
+// ============================================================
+// showcase_semantic.vgl — 语义化生成展示
+// 对比：同样的场景，语义化代码 vs 坐标堆砌
+// 此文件展示用"生成蓝图"思维编写 VGL 的威力
+// ============================================================
+
+canvas 800x600
+seed 42
+
+// 导入语义化标准库
+import "../lib/palette.vgl"
+import "../lib/sky.vgl"
+import "../lib/terrain.vgl"
+import "../lib/water.vgl"
+import "../lib/vegetation.vgl"
+import "../lib/atmosphere.vgl"
+
+// 导入所需函数
+from Palette import pick
+from Sky import gradient, sun, stars, clouds
+from Terrain import mountains, ground, grass_texture
+from Water import surface, sparkles, reflection
+from Vegetation import tree, pine, bush, flowerbed
+from Atmosphere import height_fog, fireflies
+
+// ===== 调色板：日落配色（v1.0: color() 语义化构造器）=====
+let sky_top = color(30, 20, 60)        // 深紫天顶
+let sky_mid = color(180, 80, 100)      // 玫瑰过渡
+let sky_horizon = color(255, 180, 100)  // 金色地平线
+let mountain_far = color(60, 50, 80)   // 远山紫灰
+let mountain_mid = color(45, 40, 65)   // 中山深紫
+let mountain_near = color(30, 25, 45)  // 近山黑紫
+let water_col = color(20, 30, 60)      // 水面深蓝
+let water_deep = color(10, 15, 35)     // 深水黑蓝
+let ground_col = color(40, 35, 50)     // 地面暗色
+let tree_col = color(20, 30, 25)       // 树木墨绿
+let sun_color = color(255, 220, 150)   // 太阳暖金
+let flower_colors = [color(255, 100, 100), color(255, 200, 100), color(200, 100, 255)]
+
+// ===== 天空层 =====
+// 渐变天空：从深紫到金色（默认参数已内置 sunset 配色，这里覆盖）
+gradient(sky_top, sky_horizon)
+
+// 星空（上半部分微弱星星）
+stars(count: 80, max_brightness: 0.5)
+
+// 太阳：位于地平线上方（radius 用默认值 30，只传 x, y, color）
+sun(500, 320, color: sun_color)
+
+// 云：暖色薄云（命名参数让意图清晰）
+clouds(count: 4, base_color: color(255, 200, 150), opacity: 0.4)
+
+// ===== 山脉层 =====
+// 三层山脉，从远到近，颜色由浅到深（spacing 用默认值 30，这里覆盖为 40）
+mountains(3, [mountain_far, mountain_mid, mountain_near], 380, spacing: 40)
+
+// ===== 水面层 =====
+// 湖面：从地平线开始（命名参数标注语义）
+surface(400, depth: 100, color1: water_col, color2: water_deep, wave_intensity: 0.3)
+
+// 水面光斑：夕阳反射
+sparkles(400, count: 60, color: sun_color)
+
+// 太阳倒影（命名参数让 6 个参数的含义一目了然）
+reflection(y_water: 400, sky_color: sky_horizon, sun_x: 500, sun_y: 320, sun_radius: 30, sun_color: sun_color)
+
+// ===== 前景层 =====
+// 地面
+ground(500, color: ground_col, noise_amount: 0.2)
+
+// 树木剪影（用 color() 替代裸元组）
+pine(100, 500, scale: 1.5, trunk_color: color(15, 10, 20), leaf_color: tree_col)
+pine(150, 510, scale: 1.2, trunk_color: color(15, 10, 20), leaf_color: tree_col)
+tree(700, 505, scale: 1.3, trunk_color: color(15, 10, 20), leaf_color: tree_col)
+tree(730, 500, scale: 1.0, trunk_color: color(15, 10, 20), leaf_color: tree_col)
+
+// 灌木
+bush(300, 520, scale: 1.2, color: tree_col)
+bush(550, 515, scale: 1.0, color: tree_col)
+
+// 花丛（默认参数：palette 已有预设，这里覆盖）
+flowerbed(200, 530, 150, count: 8, palette: flower_colors)
+
+// ===== 大气层 =====
+// 高度雾：营造距离感
+height_fog(350, color: color(100, 80, 120), max_intensity: 0.3)
+
+// 萤火虫（count 用默认值 15，这里显式传参）
+fireflies(count: 15, color: color(255, 255, 150))
+
+// ===== 后处理 =====
+vignette(0.35, 0.7)
+grain(0.02, 1.0)
+
+render "showcase_semantic.png"

@@ -240,6 +240,7 @@ impl Lexer {
                 "false", "continue", "struct", "import", "material", "layer", "field",
                 "null", "const", "var", // v0.9: null 字面量 + const/var 绑定
                 "as", "match", "case", "default", "enum", "class", "from", "module", // v0.9: as/match/enum/class/module 关键字
+                "step", // v1.0: for step 关键字
             ];
             if kw.contains(&ident.as_str()) {
                 return Ok(TokenWithPos { tok: Token::Keyword(ident), pos: tok_pos });

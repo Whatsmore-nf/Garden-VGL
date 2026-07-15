@@ -1,0 +1,147 @@
+// ============================================================
+// sky.vgl — 语义化天空生成库
+// 天空渐变、太阳、月亮、星星、云、极光
+// 用法: import "lib/sky.vgl"
+// v1.0: 默认参数 + color() + for 循环
+// ============================================================
+
+module Sky {
+
+// 线性渐变天空（从上到下）
+fn gradient(top = color(30, 20, 60), bottom = color(255, 180, 100)) {
+    let h = height()
+    fill_linear_gradient(0, 0, 0, h, bottom, top)
+}
+
+// 径向光晕天空
+fn radial(cx, cy, radius, inner, outer) {
+    fill_radial_gradient(cx, cy, radius, inner, outer)
+}
+
+// 太阳：径向渐变 + 多层光晕
+fn sun(x, y, radius = 30, color = color(255, 220, 150)) {
+    fill_radial_gradient(x, y, radius * 3, color, darken(color, 0.8))
+    fill_radial_gradient(x, y, radius, brighten(color, 0.3), color)
+    fill_radial_gradient(x, y, radius * 0.4, brighten(color, 0.6), brighten(color, 0.2))
+}
+
+// 月亮
+fn moon(x, y, radius = 25, color = color(240, 240, 220)) {
+    fill_radial_gradient(x - radius * 0.2, y - radius * 0.2, radius, brighten(color, 0.2), color)
+    fill_radial_gradient(x, y, radius * 2.5, darken(color, 0.3), darken(color, 0.6))
+}
+
+// 星空
+fn stars(count = 100, max_brightness = 0.8) {
+    let w = width()
+    let h = height()
+    for i in 0..count {
+        let x = rand(0, w)
+        let y = rand(0, h * 0.7)
+        let b = rand(0.3, max_brightness)
+        let r = rand(0.5, 2.0)
+        fill_circle(x, y, r, (255 * b, 255 * b, 255 * b))
+        if b > 0.7 {
+            fill_circle(x, y, r * 2, (255 * b * 0.3, 255 * b * 0.3, 255 * b * 0.3))
+        }
+    }
+}
+
+// 流星
+fn meteor(x, y, length = 100, angle = 0.5, color = color(255, 240, 200)) {
+    let dx = cos(angle) * length
+    let dy = sin(angle) * length
+    for i in 0..20 {
+        let t = i / 20
+        let px = x + dx * t
+        let py = y + dy * t
+        let alpha = 1.0 - t
+        fill_circle(px, py, (1.0 - t) * 2.0, (color[0] * alpha, color[1] * alpha, color[2] * alpha))
+    }
+}
+
+// 程序化云
+fn clouds(count = 5, base_color = color(255, 255, 255), opacity = 0.5) {
+    let w = width()
+    let h = height()
+    material cloud_mat {
+        color: base_color
+        alpha: opacity
+        noise: 0.25
+    }
+    for i in 0..count {
+        let cx = rand(0, w)
+        let cy = rand(0, h * 0.5)
+        let blobs = rand(3, 7) as int
+        for j in 0..blobs {
+            let bx = cx + rand(-40, 40)
+            let by = cy + rand(-15, 15)
+            let br = rand(20, 50)
+            stroke {
+                path: circle(bx, by, br)
+                width: rand(20, 40)
+                material: cloud_mat
+            }
+        }
+    }
+}
+
+// 层云带
+fn cloud_band(y, band_height = 40, color = color(220, 220, 230), opacity = 0.4) {
+    let w = width()
+    material band_mat {
+        color: color
+        alpha: opacity
+        noise: 0.3
+    }
+    for x in 0..w step 25 {
+        let n = perlin(x * 0.005, y * 0.01)
+        let blob_r = 30 + n * 20
+        let blob_y = y + perlin(x * 0.01, 100) * band_height
+        stroke {
+            path: circle(x, blob_y, blob_r)
+            width: band_height * 0.6
+            material: band_mat
+        }
+    }
+}
+
+// 极光
+fn aurora(bands = 3, color1 = color(80, 255, 180), color2 = color(180, 100, 255), intensity = 0.6) {
+    let w = width()
+    let h = height()
+    for i in 0..bands {
+        let base_y = h * 0.15 + i * 30
+        for x in 0..w step 30 {
+            let wave = perlin(x * 0.003, i * 0.5) * 80
+            let y = base_y + wave
+            let t = perlin(x * 0.008, i * 2)
+            let col = lerp_color(color1, color2, t)
+            let alpha = intensity * (0.3 + perlin(x * 0.01, i) * 0.4)
+            material aurora_mat {
+                color: col
+                alpha: alpha
+                noise: 0.1
+            }
+            stroke {
+                path: line(x, y, x + 30, y + perlin((x + 30) * 0.003, i * 0.5) * 80)
+                width: 15 + perlin(x * 0.005, i) * 10
+                material: aurora_mat
+            }
+        }
+    }
+}
+
+// 雾层
+fn mist(y_start, color = color(200, 200, 200), intensity = 0.3) {
+    let w = width()
+    let h = height()
+    for y in y_start..h {
+        for x in 0..w {
+            let n = perlin(x * 0.01, y * 0.01) * 0.5 + 0.5
+            pixel(x: x, y: y, rgb: lerp_color((color[0], color[1], color[2]), brighten(color, 0.2), n))
+        }
+    }
+}
+
+} // end module Sky

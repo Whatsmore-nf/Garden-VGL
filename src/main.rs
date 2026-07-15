@@ -1,7 +1,7 @@
-// VGL 解释器 — Rust 版（v0.9 语言完整度大版本）
-// 对应规范: VGL_语法规范 v0.5.txt（v0.9 修订）
+// VGL 解释器 — Rust 版（v1.0 语义化生成）
 // 用法:
 //   vgl [--continue-on-error] <file.vgl>
+//   vgl replicate --mode semantic <input.png> <output.vgl>  (推荐)
 //   vgl replicate --mode pixel <input.png> <output.vgl>
 //   vgl replicate --mode block <input.png> <output.vgl> [--block-size 16]
 //   vgl replicate --mode progressive <input.png> <output.vgl> [--layers 32,8,1] [--threshold 30]
@@ -46,8 +46,9 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("VGL v0.6 用法:");
+    eprintln!("VGL v1.0 用法:");
     eprintln!("  vgl [--continue-on-error] <file.vgl>");
+    eprintln!("  vgl replicate --mode semantic <input.png> <output.vgl>  (推荐: 语义化生成蓝图)");
     eprintln!("  vgl replicate --mode pixel <input.png> <output.vgl>");
     eprintln!("  vgl replicate --mode block <input.png> <output.vgl> [--block-size 16]");
     eprintln!("  vgl replicate --mode progressive <input.png> <output.vgl> [--layers 32,8,1] [--threshold 30]");
@@ -228,11 +229,12 @@ fn run_replicate(args: &[String]) -> i32 {
 
     let mut code = String::new();
     match mode.as_str() {
+        "semantic" => replicate::replicate_semantic(&img, &mut code),
         "pixel" => replicate::replicate_pixel(&img, &input_abs, &mut code),
         "block" => replicate::replicate_block(&img, block_size, &mut code),
         "progressive" => replicate::replicate_progressive(&img, &layers, threshold, &mut code),
         _ => {
-            eprintln!("错误: 未知模式 '{}'（支持: pixel / block / progressive）", mode);
+            eprintln!("错误: 未知模式 '{}'（支持: semantic / pixel / block / progressive）", mode);
             return 1;
         }
     }
