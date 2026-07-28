@@ -1,0 +1,23 @@
+// demo.vgl - Simple VGL demo: gradient background with stars
+
+canvas 400x300
+bg #0a0a1a
+
+// Draw stars
+for i in 0..200 {
+    let x = int(rand(0, 400))
+    let y = int(rand(0, 200))
+    let b = int(rand(150, 255))
+    pixel(x: x, y: y, rgb: (b, b, b))
+}
+
+// Draw a simple moon
+for i in 0..30 {
+    let a = rand(0, 6.28)
+    let r = rand(25, 35)
+    let px = int(320 + r * cos(a))
+    let py = int(70 + r * sin(a))
+    pixel(x: px, y: py, rgb: (255, 230, 150))
+}
+
+render "output/cpp_demo.png"
