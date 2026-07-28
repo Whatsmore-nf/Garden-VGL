@@ -1,27 +1,42 @@
-# 输出目录（运行时生成的图像）
-output/
-# 根目录渲染产物（render "xxx.png" 相对路径输出）
-*.png
+```
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.out
 
-# Rust
-target/
+# CMake build directory
+build/
 
-# Python 缓存
-__pycache__/
-*.py[cod]
-
-# 虚拟环境
+# Dependencies
 venv/
 .venv/
-env/
+__pycache__/
+*.egg-info/
 
-# IDE
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
 .vscode/
 .idea/
-*.swp
-*.swo
 
-# 操作系统
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# OS specific
 .DS_Store
 Thumbs.db
-desktop.ini
+```
