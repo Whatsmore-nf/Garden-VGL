@@ -1,15 +1,14 @@
 [package]
 name = "vgl"
-version = "0.9.0"
+version = "2.0.0"
 edition = "2021"
+description = "VGL — 面向 AI 的矢量图形语言，输出 SVG"
 
 [[bin]]
 name = "vgl"
 path = "src/main.rs"
 
 [dependencies]
-rand = "0.8"
-image = "0.24"
 
 [profile.release]
 opt-level = 3

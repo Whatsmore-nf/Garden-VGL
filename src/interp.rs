@@ -1,3581 +1,1486 @@
 // ============================================================
-// 控制流信号
+// VGL v2.0 — 解释器
+// 执行语句构建矢量场景图，render 时序列化为 SVG
 // ============================================================
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use image::{ImageBuffer, Rgb};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use crate::ast::*;
+use crate::error::{VglError, VglResult};
+use crate::noise::{fbm, perlin, seeded_perm, Rng};
+use crate::scene::{Element, Scene};
+use crate::svg::{fmt_num, write_svg};
 
-use crate::ast::{Env, Expr, Stmt, StmtWithPos, Value};
-use crate::canvas::{draw_polyline_join, Canvas, MaterialParams};
-use crate::error::{clamp_f32, clamp_u8, format_error, VglError, VglResult};
-use crate::lexer::Lexer;
-use crate::noise::{fbm, perlin, perlin_seeded, worley};
-use crate::parser::Parser;
-
-#[derive(Debug)]
 pub enum Control {
-    Normal,                   // 正常执行，无控制流
-    Break(Option<String>), // v0.4 带标签 break
+    Normal,
+    Break,
     Continue,
     Return(Value),
 }
 
-pub type ExecResult = Result<Control, VglError>;
-
-// ============================================================
-// 解释器
-// ============================================================
-
-/// v0.8 2D 变换矩阵（2x3 仿射变换）
-#[derive(Clone, Debug)]
-pub struct Transform {
-    pub a: f64, pub b: f64, // 第一行: a*c + e = x'
-    pub c: f64, pub d: f64, // 第二行: b*c + f = y'
-    pub e: f64, pub f: f64, // 平移
-}
-
-impl Transform {
-    pub fn identity() -> Self {
-        Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
-    }
-    /// 应用变换到点 (x, y)
-    pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
-        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
-    }
-    /// 矩阵乘法 self * other（先 other 后 self）
-    pub fn compose(&self, other: &Transform) -> Transform {
-        Transform {
-            a: self.a * other.a + self.c * other.b,
-            b: self.b * other.a + self.d * other.b,
-            c: self.a * other.c + self.c * other.d,
-            d: self.b * other.c + self.d * other.d,
-            e: self.a * other.e + self.c * other.f + self.e,
-            f: self.b * other.e + self.d * other.f + self.f,
-        }
-    }
-    pub fn translate(tx: f64, ty: f64) -> Self {
-        Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
-    }
-    pub fn rotate(rad: f64) -> Self {
-        let (s, c) = rad.sin_cos();
-        Transform { a: c, b: s, c: -s, d: c, e: 0.0, f: 0.0 }
-    }
-    pub fn scale(sx: f64, sy: f64) -> Self {
-        Transform { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 }
-    }
-}
-
-/// v0.8 裁剪矩形
-#[derive(Clone, Debug)]
-pub struct ClipRect {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
-}
+const MAX_DEPTH: usize = 2048;
 
 pub struct Interpreter {
-    pub canvas: Option<Canvas>,
-    pub layers: HashMap<String, Value>,
-    pub struct_defs: HashMap<String, (Vec<String>, Vec<Value>)>,
+    pub rng: Rng,
+    pub perm: Vec<usize>,
+    pub scene: Scene,
+    /// 渐变/滤镜内容 → def id（去重）
+    def_map: HashMap<String, String>,
+    next_def: usize,
+    /// 已 import 的绝对路径
     pub imported: Vec<String>,
-    pub rng: Rc<RefCell<StdRng>>,
+    /// 主脚本目录（render 输出相对基准）
+    pub base_dir: String,
+    /// 当前正在执行的文件（错误定位 & use 相对路径）
     pub current_dir: String,
     pub current_filename: String,
     pub current_src: String,
-    pub current_pos: Option<usize>,
-    pub warnings: Vec<crate::error::VglWarning>,
-    pub bg_set: bool,
-    pub transform_stack: Vec<Transform>,  // v0.8 变换栈
-    pub clip_stack: Vec<ClipRect>,         // v0.8 裁剪栈
-    pub noise_perm: Option<[usize; 512]>,  // v0.8 可种子化 Perlin 置换表
-    pub class_defs: HashMap<String, Rc<crate::ast::ClassData>>, // v0.9: 类定义
-    pub linear_mode: bool,                 // v0.9: sRGB 线性工作流开关
+    depth: usize,
+    /// render 后报告
+    pub rendered: Vec<String>,
 }
 
 impl Interpreter {
     pub fn new() -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x5EED);
         Interpreter {
-            canvas: None,
-            layers: HashMap::new(),
-            struct_defs: HashMap::new(),
+            rng: Rng::new(seed),
+            perm: seeded_perm(seed),
+            scene: Scene::new(),
+            def_map: HashMap::new(),
+            next_def: 0,
             imported: Vec::new(),
-            rng: Rc::new(RefCell::new(StdRng::from_entropy())),
+            base_dir: ".".to_string(),
             current_dir: ".".to_string(),
-            current_filename: "".to_string(),
-            current_src: "".to_string(),
-            current_pos: None,
-            warnings: Vec::new(),
-            bg_set: false,
-            transform_stack: vec![Transform::identity()],
-            clip_stack: Vec::new(),
-            noise_perm: None,
-            class_defs: HashMap::new(),
-            linear_mode: false,
+            current_filename: "<main>".to_string(),
+            current_src: String::new(),
+            depth: 0,
+            rendered: Vec::new(),
         }
     }
 
-    pub fn warn(&mut self, msg: impl Into<String>) {
-        self.warnings
-            .push(crate::error::VglWarning::new(msg, self.current_pos));
+    pub fn init_globals(env: &Rc<RefCell<Env>>) {
+        Env::define(env, "PI", Value::Num(std::f64::consts::PI));
+        Env::define(env, "TAU", Value::Num(std::f64::consts::TAU));
     }
 
-    // v0.9: 将 Value 转换为字符串表示（供 as str 和 str() 内建函数共用）
-    pub fn value_to_string(&self, v: &Value) -> String {
-        match v {
-            Value::Number(n) => format!("{}", n),
-            Value::Bool(b) => b.to_string(),
-            Value::String(s) => s.clone(),
-            Value::Color(r, g, b, a) => {
-                if *a == 255 {
-                    format!("#{:02x}{:02x}{:02x}", r, g, b)
-                } else {
-                    format!("#{:02x}{:02x}{:02x}{:02x}", r, g, b, a)
-                }
-            }
-            Value::None => "none".to_string(),
-            _ => format!("{:?}", v),
-        }
-    }
+    // ==================== 语句执行 ====================
 
-    pub fn eval(&mut self, expr: &Expr, env: Rc<RefCell<Env>>) -> VglResult<Value> {
-        match expr {
-            Expr::Number(n) => Ok(Value::Number(*n)),
-            Expr::String(s) => Ok(Value::String(s.clone())),
-            Expr::Color(r, g, b, a) => Ok(Value::Color(*r, *g, *b, *a)),
-            Expr::Bool(b) => Ok(Value::Bool(*b)),
-            // v0.9: null 字面量
-            Expr::Null => Ok(Value::None),
-            Expr::Ident(name) => {
-                if let Some(v) = env.borrow().get(name) {
-                    Ok(v)
-                } else {
-                    Err(VglError::new(format!("未定义变量: {}", name), self.current_pos))
-                }
+    pub fn exec(&mut self, stmt: &Stmt, env: Rc<RefCell<Env>>) -> VglResult<Control> {
+        match stmt {
+            Stmt::Use(path, pos) => {
+                self.exec_use(path, env, *pos)?;
+                Ok(Control::Normal)
             }
-            Expr::Tuple(el) => {
-                let mut vals = Vec::new();
-                for e in el {
-                    vals.push(self.eval(e, env.clone())?);
-                }
-                Ok(Value::Tuple(vals))
-            }
-            Expr::Array(el) => {
-                let mut vals = Vec::new();
-                for e in el {
-                    vals.push(self.eval(e, env.clone())?);
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(vals))))
-            }
-            Expr::BinOp(op, l, r, pos) => {
-                self.current_pos = Some(*pos);
-                let lv = self.eval(l, env.clone())?;
-                let rv = self.eval(r, env.clone())?;
-                match (&lv, &rv) {
-                    (Value::Number(a), Value::Number(b)) => {
-                        let res = match op.as_str() {
-                            "+" => a + b,
-                            "-" => a - b,
-                            "*" => a * b,
-                            "/" => a / b,
-                            // v0.8: 取模运算符
-                            "%" => {
-                                if *b == 0.0 {
-                                    return Err(VglError::new("取模除零错误", self.current_pos));
-                                }
-                                a % b
-                            }
-                            // v0.9: 位运算符（对整数操作，f64→i64→运算→f64）
-                            "&" => (a.trunc() as i64 & b.trunc() as i64) as f64,
-                            "|" => (a.trunc() as i64 | b.trunc() as i64) as f64,
-                            "^" => (a.trunc() as i64 ^ b.trunc() as i64) as f64,
-                            "<<" => {
-                                let sh = b.trunc() as i64;
-                                if sh < 0 || sh >= 64 {
-                                    0.0
-                                } else {
-                                    ((a.trunc() as i64) << sh) as f64
-                                }
-                            }
-                            ">>" => {
-                                let sh = b.trunc() as i64;
-                                if sh < 0 || sh >= 64 {
-                                    0.0
-                                } else {
-                                    ((a.trunc() as i64) >> sh) as f64
-                                }
-                            }
-                            "<" => return Ok(Value::Bool(a < b)),
-                            ">" => return Ok(Value::Bool(a > b)),
-                            "<=" => return Ok(Value::Bool(a <= b)),
-                            ">=" => return Ok(Value::Bool(a >= b)),
-                            "==" => return Ok(Value::Bool(a == b)),
-                            "!=" => return Ok(Value::Bool(a != b)),
-                            _ => return Err(VglError::new(format!("未知运算符 {}", op), self.current_pos)),
-                        };
-                        Ok(Value::Number(res))
-                    }
-                    (Value::Tuple(a), Value::Tuple(b)) => {
-                        if a.len() != b.len() {
-                            return Err(VglError::new("元组长度不匹配", self.current_pos));
-                        }
-                        match op.as_str() {
-                            "+" => {
-                                let res: Vec<Value> = a.iter().zip(b.iter()).map(|(x, y)| {
-                                    Value::Number(x.as_number().unwrap_or(0.0) + y.as_number().unwrap_or(0.0))
-                                }).collect();
-                                return Ok(Value::Tuple(res));
-                            }
-                            "-" => {
-                                let res: Vec<Value> = a.iter().zip(b.iter()).map(|(x, y)| {
-                                    Value::Number(x.as_number().unwrap_or(0.0) - y.as_number().unwrap_or(0.0))
-                                }).collect();
-                                return Ok(Value::Tuple(res));
-                            }
-                            "==" => {
-                                let eq = a.iter().zip(b.iter()).all(|(x, y)| {
-                                    if let (Value::Number(xn), Value::Number(yn)) = (x, y) { xn == yn }
-                                    else { x == y }
-                                });
-                                return Ok(Value::Bool(eq));
-                            }
-                            "!=" => {
-                                let ne = a.iter().zip(b.iter()).any(|(x, y)| {
-                                    if let (Value::Number(xn), Value::Number(yn)) = (x, y) { xn != yn }
-                                    else { x != y }
-                                });
-                                return Ok(Value::Bool(ne));
-                            }
-                            "<" | ">" | "<=" | ">=" => {
-                                for (x, y) in a.iter().zip(b.iter()) {
-                                    let xn = x.as_number().ok_or_else(|| VglError::new("元组比较需要元素为 number", self.current_pos))?;
-                                    let yn = y.as_number().ok_or_else(|| VglError::new("元组比较需要元素为 number", self.current_pos))?;
-                                    if xn < yn { return Ok(Value::Bool(op == "<" || op == "<=")); }
-                                    if xn > yn { return Ok(Value::Bool(op == ">" || op == ">=")); }
-                                }
-                                return Ok(Value::Bool(op == "<=" || op == ">="));
-                            }
-                            _ => return Err(VglError::new("元组只支持 +/-/比较", self.current_pos)),
-                        }
-                    }
-                    (Value::Tuple(t), Value::Number(n)) if op == "*" => {
-                        let res = t.iter().map(|v| Value::Number(v.as_number().unwrap_or(0.0) * n)).collect();
-                        Ok(Value::Tuple(res))
-                    }
-                    (Value::Number(n), Value::Tuple(t)) if op == "*" => {
-                        let res = t.iter().map(|v| Value::Number(v.as_number().unwrap_or(0.0) * n)).collect();
-                        Ok(Value::Tuple(res))
-                    }
-                    (Value::Tuple(t), Value::Number(n)) if op == "/" => {
-                        let res = t.iter().map(|v| Value::Number(v.as_number().unwrap_or(0.0) / n)).collect();
-                        Ok(Value::Tuple(res))
-                    }
-                    _ => Err(VglError::new(format!("类型不匹配: {:?} {} {:?}", lv, op, rv), self.current_pos)),
-                }
-            }
-            Expr::LogicOp(op, l, r, pos) => {
-                self.current_pos = Some(*pos);
-                let lv = self.eval(l, env.clone())?;
-                let lb = match lv {
-                    Value::Bool(b) => b,
-                    Value::Number(n) => n != 0.0,
-                    _ => return Err(VglError::new("逻辑运算需要 bool", self.current_pos)),
-                };
-                if op == "and" {
-                    if !lb {
-                        return Ok(Value::Bool(false));
-                    }
-                    let rv = self.eval(r, env.clone())?;
-                    match rv {
-                        Value::Bool(b) => Ok(Value::Bool(b)),
-                        Value::Number(n) => Ok(Value::Bool(n != 0.0)),
-                        _ => Err(VglError::new("逻辑运算需要 bool", self.current_pos)),
-                    }
-                } else {
-                    if lb {
-                        return Ok(Value::Bool(true));
-                    }
-                    let rv = self.eval(r, env.clone())?;
-                    match rv {
-                        Value::Bool(b) => Ok(Value::Bool(b)),
-                        Value::Number(n) => Ok(Value::Bool(n != 0.0)),
-                        _ => Err(VglError::new("逻辑运算需要 bool", self.current_pos)),
-                    }
-                }
-            }
-            Expr::UnaryNot(e, pos) => {
-                self.current_pos = Some(*pos);
-                let v = self.eval(e, env.clone())?;
-                match v {
-                    Value::Bool(b) => Ok(Value::Bool(!b)),
-                    Value::Number(n) => Ok(Value::Bool(n == 0.0)),
-                    _ => Err(VglError::new("not 作用于非 bool", self.current_pos)),
-                }
-            }
-            // v0.9: 一元位反 ~（整数按位取反）
-            Expr::BitNot(e, pos) => {
-                self.current_pos = Some(*pos);
-                let v = self.eval(e, env.clone())?;
-                match v {
-                    Value::Number(n) => Ok(Value::Number(!(n.trunc() as i64) as f64)),
-                    _ => Err(VglError::new("~ 作用于非 number", self.current_pos)),
-                }
-            }
-            // v0.9: as 类型转换
-            Expr::As(e, type_name, pos) => {
-                self.current_pos = Some(*pos);
-                let v = self.eval(e, env.clone())?;
-                match type_name.as_str() {
-                    "int" => match v {
-                        Value::Number(n) => Ok(Value::Number(n.trunc() as i64 as f64)),
-                        Value::String(s) => s.parse::<f64>()
-                            .map(|n| Value::Number(n.trunc() as i64 as f64))
-                            .map_err(|_| VglError::new(format!("无法将字符串 '{}' 转为 int", s), self.current_pos)),
-                        Value::Bool(b) => Ok(Value::Number(if b { 1.0 } else { 0.0 })),
-                        _ => Err(VglError::new("as int 需要 number/string/bool", self.current_pos)),
-                    },
-                    "float" => match v {
-                        Value::Number(n) => Ok(Value::Number(n)),
-                        Value::String(s) => s.parse::<f64>()
-                            .map(Value::Number)
-                            .map_err(|_| VglError::new(format!("无法将字符串 '{}' 转为 float", s), self.current_pos)),
-                        Value::Bool(b) => Ok(Value::Number(if b { 1.0 } else { 0.0 })),
-                        _ => Err(VglError::new("as float 需要 number/string/bool", self.current_pos)),
-                    },
-                    "bool" => match v {
-                        Value::Number(n) => Ok(Value::Bool(n != 0.0)),
-                        Value::String(s) => Ok(Value::Bool(!s.is_empty())),
-                        Value::Bool(b) => Ok(Value::Bool(b)),
-                        Value::None => Ok(Value::Bool(false)),
-                        _ => Err(VglError::new("as bool 需要 number/string/bool/null", self.current_pos)),
-                    },
-                    "str" => Ok(Value::String(self.value_to_string(&v))),
-                    "color" => match v {
-                        Value::String(s) => {
-                            // 解析 "#RRGGBB" 或 "#RRGGBBAA" 格式
-                            let hex = s.trim_start_matches('#');
-                            let parse_hex = |h: &str| u8::from_str_radix(h, 16).unwrap_or(0);
-                            if hex.len() == 6 {
-                                Ok(Value::Color(parse_hex(&hex[0..2]), parse_hex(&hex[2..4]), parse_hex(&hex[4..6]), 255))
-                            } else if hex.len() == 8 {
-                                Ok(Value::Color(parse_hex(&hex[0..2]), parse_hex(&hex[2..4]), parse_hex(&hex[4..6]), parse_hex(&hex[6..8])))
-                            } else if hex.len() == 3 {
-                                Ok(Value::Color(
-                                    parse_hex(&format!("{}{}", &hex[0..1], &hex[0..1])),
-                                    parse_hex(&format!("{}{}", &hex[1..2], &hex[1..2])),
-                                    parse_hex(&format!("{}{}", &hex[2..3], &hex[2..3])),
-                                    255,
-                                ))
-                            } else {
-                                Err(VglError::new(format!("无法解析颜色: {}", s), self.current_pos))
-                            }
-                        }
-                        Value::Color(r, g, b, a) => Ok(Value::Color(r, g, b, a)),
-                        Value::Tuple(t) if t.len() == 3 || t.len() == 4 => {
-                            let r = t[0].as_number().unwrap_or(0.0) as u8;
-                            let g = t[1].as_number().unwrap_or(0.0) as u8;
-                            let b = t[2].as_number().unwrap_or(0.0) as u8;
-                            let a = if t.len() == 4 { t[3].as_number().unwrap_or(255.0) as u8 } else { 255 };
-                            Ok(Value::Color(r, g, b, a))
-                        }
-                        _ => Err(VglError::new("as color 需要 string/tuple/color", self.current_pos)),
-                    },
-                    _ => Err(VglError::new(format!("未知类型: {}（支持 int/float/bool/str/color）", type_name), self.current_pos)),
-                }
-            }
-            Expr::Call(name, args, kwargs, pos) => {
-                self.current_pos = Some(*pos);
-                self.eval_call(name, args, kwargs, env)
-            }
-            Expr::Index(base, idx, pos) => {
-                self.current_pos = Some(*pos);
-                let base_val = self.eval(base, env.clone())?;
-                let idx_val = self.eval(idx, env.clone())?;
-                match base_val {
-                    Value::Tuple(t) => {
-                        let i = idx_val.as_number().unwrap_or(0.0) as usize;
-                        if i < t.len() {
-                            Ok(t[i].clone())
-                        } else {
-                            Err(VglError::new("索引越界", self.current_pos))
-                        }
-                    }
-                    Value::Array(arr) => {
-                        let i = idx_val.as_number().unwrap_or(0.0) as usize;
-                        let arr_ref = arr.borrow();
-                        if i < arr_ref.len() {
-                            Ok(arr_ref[i].clone())
-                        } else {
-                            Err(VglError::new("索引越界", self.current_pos))
-                        }
-                    }
-                    Value::Dict(d) => {
-                        let key = idx_val.as_string().unwrap_or_default();
-                        let d_ref = d.borrow();
-                        d_ref.get(&key).cloned().map(Ok).unwrap_or_else(|| {
-                            Err(VglError::new(format!("键不存在: {}", key), self.current_pos))
-                        })
-                    }
-                    _ => Err(VglError::new("不支持索引", self.current_pos)),
-                }
-            }
-            Expr::FieldAccess(obj, field, pos) => {
-                self.current_pos = Some(*pos);
-                let obj_val = self.eval(obj, env.clone())?;
-                match obj_val {
-                    Value::Struct(s) => {
-                        let s_ref = s.borrow();
-                        s_ref.get(field).cloned().map(Ok).unwrap_or_else(|| {
-                            Err(VglError::new(format!("字段不存在: {}", field), self.current_pos))
-                        })
-                    }
-                    // v0.9: enum 无参变体访问 EnumName.Variant
-                    Value::EnumDef(_, ref variants) => {
-                        if variants.contains_key(field) {
-                            let arity = variants[field];
-                            if arity == 0 {
-                                // 无关联值的变体
-                                let enum_name = if let Value::EnumDef(n, _) = &obj_val { n.clone() } else { String::new() };
-                                Ok(Value::Enum(enum_name, field.clone(), vec![]))
-                            } else {
-                                Err(VglError::new(format!("变体 {} 需要 {} 个参数", field, arity), self.current_pos))
-                            }
-                        } else {
-                            Err(VglError::new(format!("枚举无此变体: {}", field), self.current_pos))
-                        }
-                    }
-                    // v0.9: instance 字段访问
-                    Value::Instance(data) => {
-                        let data_ref = data.borrow();
-                        // 在自身字段查找
-                        if let Some(v) = data_ref.fields.get(field) {
-                            return Ok(v.clone());
-                        }
-                        Err(VglError::new(format!("字段不存在: {}", field), self.current_pos))
-                    }
-                    // v0.9: module 命名空间访问 Module.item
-                    Value::Module(_, ref mod_env) => {
-                        if let Some(v) = mod_env.borrow().get(field) {
-                            Ok(v)
-                        } else {
-                            Err(VglError::new(format!("模块中无此项: {}", field), self.current_pos))
-                        }
-                    }
-                    _ => Err(VglError::new("不是结构体/枚举/实例/模块", self.current_pos)),
-                }
-            }
-            // v0.9: 方法调用 obj.method(args)
-            Expr::MethodCall(obj_expr, method, args, kwargs, pos) => {
-                self.current_pos = Some(*pos);
-                let obj_val = self.eval(obj_expr, env.clone())?;
-                match &obj_val {
-                    // enum 构造：EnumName.Variant(args)
-                    Value::EnumDef(enum_name, variants) => {
-                        if let Some(&arity) = variants.get(method) {
-                            if args.len() != arity {
-                                return Err(VglError::new(
-                                    format!("变体 {} 需要 {} 个参数，得到 {}", method, arity, args.len()),
-                                    self.current_pos,
-                                ));
-                            }
-                            let mut vals = Vec::new();
-                            for a in args {
-                                vals.push(self.eval(a, env.clone())?);
-                            }
-                            return Ok(Value::Enum(enum_name.clone(), method.clone(), vals));
-                        } else {
-                            return Err(VglError::new(format!("枚举无此变体: {}", method), self.current_pos));
-                        }
-                    }
-                    // class 实例方法调用
-                    Value::Instance(data) => {
-                        let class_name = data.borrow().class_name.clone();
-                        let self_val = obj_val.clone();
-                        if let Some((params, body)) = self.lookup_method(&class_name, method)? {
-                            // 调用方法：绑定 self 并执行
-                            return self.invoke_method(&params, &body, args, kwargs, &self_val, env);
-                        }
-                        return Err(VglError::new(format!("方法不存在: {}", method), self.current_pos));
-                    }
-                    _ => Err(VglError::new("方法调用目标不是枚举/实例", self.current_pos)),
-                }
-            }
-        }
-    }
-
-    pub fn eval_call(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        kwargs: &HashMap<String, Expr>,
-        env: Rc<RefCell<Env>>,
-    ) -> VglResult<Value> {
-        // v0.9: linear() — 开启 sRGB 线性工作流
-        if name == "linear" {
-            self.linear_mode = true;
-            if let Some(canvas) = &mut self.canvas {
-                canvas.linear_mode = true;
-            }
-            return Ok(Value::None);
-        }
-        // compose / fill 内建（需要 self）
-        if name == "compose" {
-            let layer_name = self.eval(&args[0], env.clone())?.as_string().unwrap_or_default();
-            let blend = if args.len() > 1 {
-                self.eval(&args[1], env.clone())?.as_string().unwrap_or_else(|| "over".to_string())
-            } else {
-                "over".to_string()
-            };
-            self.compose_layer(&layer_name, &blend)?;
-            return Ok(Value::None);
-        }
-        if name == "fill" {
-            let field_name = self.eval(&args[0], env.clone())?.as_string().unwrap_or_default();
-            self.fill_field(&field_name, env)?;
-            return Ok(Value::None);
-        }
-        // v0.7 后处理函数（需要 self.canvas）
-        if matches!(name, "grain" | "vignette" | "blur" | "sharpen") {
-            let mut arg_vals = Vec::new();
-            for a in args {
-                arg_vals.push(self.eval(a, env.clone())?);
-            }
-            self.apply_postprocess(name, &arg_vals)?;
-            return Ok(Value::None);
-        }
-        // v0.75 填充函数（直接绘制，不经 stroke）
-        if matches!(name, "fill_rect" | "fill_circle" | "fill_ellipse" | "fill_polygon" | "flood_fill") {
-            let mut arg_vals = Vec::new();
-            for a in args {
-                arg_vals.push(self.eval(a, env.clone())?);
-            }
-            self.apply_fill(name, &arg_vals)?;
-            return Ok(Value::None);
-        }
-        // v0.8 变换 & 裁剪
-        if matches!(name, "translate" | "rotate" | "scale" | "push_transform" | "pop_transform" | "clip_rect" | "clip_clear") {
-            let mut arg_vals = Vec::new();
-            for a in args {
-                arg_vals.push(self.eval(a, env.clone())?);
-            }
-            self.apply_transform(name, &arg_vals)?;
-            return Ok(Value::None);
-        }
-        // v0.8 渐变填充函数（直接绘制，不经 stroke）
-        if matches!(name, "fill_linear_gradient" | "fill_radial_gradient") {
-            let mut arg_vals = Vec::new();
-            for a in args {
-                arg_vals.push(self.eval(a, env.clone())?);
-            }
-            self.apply_gradient(name, &arg_vals)?;
-            return Ok(Value::None);
-        }
-        // v0.8 文本绘制函数
-        if name == "text" {
-            let mut arg_vals = Vec::new();
-            for a in args {
-                arg_vals.push(self.eval(a, env.clone())?);
-            }
-            self.apply_text(&arg_vals)?;
-            return Ok(Value::None);
-        }
-        // struct 构造
-        if self.struct_defs.contains_key(name) {
-            return self.construct_struct(name, args, kwargs, env);
-        }
-        // v0.9: class 构造
-        if self.class_defs.contains_key(name) {
-            return self.construct_class(name, args, kwargs, env);
-        }
-        // 求值参数
-        let mut arg_vals = Vec::new();
-        for a in args {
-            arg_vals.push(self.eval(a, env.clone())?);
-        }
-        // 内建函数
-        if let Some(v) = self.call_builtin(name, &arg_vals)? {
-            return Ok(v);
-        }
-        // 用户函数 / 闭包
-        if let Some(Value::Closure(_, params, body, closure_env)) = env.borrow().get(name) {
-            let new_env = Rc::new(RefCell::new(Env::new(Some(closure_env.clone()))));
-            // v1.0: 1. 先应用默认值（在闭包定义环境中求值）
-            for (pname, default) in params.iter() {
-                if let Some(def_expr) = default {
-                    let dv = self.eval(def_expr, closure_env.clone())?;
-                    new_env.borrow_mut().vars.insert(pname.clone(), dv);
-                }
-            }
-            // 2. 应用位置参数（覆盖默认值）
-            for (i, (pname, _)) in params.iter().enumerate() {
-                if i < args.len() {
-                    new_env.borrow_mut().vars.insert(pname.clone(), arg_vals[i].clone());
-                }
-            }
-            // 3. 应用命名参数（覆盖默认值和位置参数）+ v1.0 参数名校验
-            let param_names: std::collections::HashSet<&str> =
-                params.iter().map(|(n, _)| n.as_str()).collect();
-            for (k, v) in kwargs {
-                if !param_names.contains(k.as_str()) {
+            Stmt::Canvas { w, h, pos } => {
+                if *w <= 0.0 || *h <= 0.0 {
                     return Err(VglError::new(
-                        format!("函数 {} 没有参数 '{}'", name, k),
-                        self.current_pos,
+                        format!("canvas 尺寸必须为正数（得到 {}x{}）", w, h),
+                        *pos,
                     ));
                 }
-                new_env.borrow_mut().vars.insert(k.clone(), self.eval(v, env.clone())?);
+                self.scene.width = *w;
+                self.scene.height = *h;
+                Ok(Control::Normal)
             }
-            match self.execute_block(&body, new_env)? {
-                Control::Return(v) => Ok(v),
-                _ => Ok(Value::None),
-            }
-        } else {
-            Err(VglError::new(format!("未定义函数: {}", name), self.current_pos))
-        }
-    }
-
-    /// 调用内建函数。返回 Ok(Some(v)) 表示已处理，Ok(None) 表示非内建。
-    /// v0.5 修复：rand 使用 self.rng 而非 thread_rng，使 seed 生效
-    pub fn call_builtin(&mut self, name: &str, args: &[Value]) -> VglResult<Option<Value>> {
-        macro_rules! num {
-            ($i:expr) => {
-                args.get($i).and_then(|v| v.as_number()).unwrap_or(0.0)
-            };
-        }
-        let v = match name {
-            "rand" => {
-                let a = num!(0);
-                let b = num!(1);
-                if a >= b {
-                    return Err(VglError::new(format!("rand(a,b) 要求 a < b，得到 a={}, b={}", a, b), self.current_pos));
-                }
-                Value::Number(self.rng.borrow_mut().gen_range(a..b))
-            }
-            "int" => Value::Number(num!(0).floor()),
-            "abs" => Value::Number(num!(0).abs()),
-            "floor" => Value::Number(num!(0).floor()),
-            "ceil" => Value::Number(num!(0).ceil()),
-            "sin" => Value::Number(num!(0).sin()),
-            "cos" => Value::Number(num!(0).cos()),
-            "sqrt" => Value::Number(num!(0).sqrt()),
-            "pow" => Value::Number(num!(0).powf(num!(1))),
-            "min" => Value::Number(num!(0).min(num!(1))),
-            "max" => Value::Number(num!(0).max(num!(1))),
-            // v0.7 数学函数扩展
-            "tan" => Value::Number(num!(0).tan()),
-            "asin" => Value::Number(num!(0).asin()),
-            "acos" => Value::Number(num!(0).acos()),
-            "atan" => Value::Number(num!(0).atan()),
-            "atan2" => Value::Number(num!(0).atan2(num!(1))),
-            "log" => Value::Number(num!(0).ln()),
-            "log2" => Value::Number(num!(0).log2()),
-            "log10" => Value::Number(num!(0).log10()),
-            "exp" => Value::Number(num!(0).exp()),
-            "round" => Value::Number(num!(0).round()),
-            "sign" => Value::Number(num!(0).signum()),
-            "clamp" => {
-                let x = num!(0);
-                let lo = num!(1);
-                let hi = num!(2);
-                Value::Number(x.max(lo).min(hi))
-            }
-            "lerp" => {
-                let a = num!(0);
-                let b = num!(1);
-                let t = num!(2);
-                Value::Number(a + (b - a) * t)
-            }
-            "smoothstep" => {
-                let e0 = num!(0);
-                let e1 = num!(1);
-                let x = num!(2);
-                let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-                Value::Number(t * t * (3.0 - 2.0 * t))
-            }
-            "radians" => Value::Number(num!(0) * std::f64::consts::PI / 180.0),
-            "degrees" => Value::Number(num!(0) * 180.0 / std::f64::consts::PI),
-            "pi" => Value::Number(std::f64::consts::PI),
-            "e" => Value::Number(std::f64::consts::E),
-            // v0.7 颜色函数
-            "rgb_to_hsl" => {
-                let r = num!(0) / 255.0;
-                let g = num!(1) / 255.0;
-                let b = num!(2) / 255.0;
-                let max = r.max(g).max(b);
-                let min = r.min(g).min(b);
-                let l = (max + min) / 2.0;
-                if (max - min).abs() < 1e-10 {
-                    Value::Tuple(vec![Value::Number(0.0), Value::Number(0.0), Value::Number(l)])
-                } else {
-                    let d = max - min;
-                    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
-                    let h = if max == r {
-                        ((g - b) / d) % 6.0
-                    } else if max == g {
-                        (b - r) / d + 2.0
-                    } else {
-                        (r - g) / d + 4.0
-                    };
-                    let h = if h < 0.0 { h + 6.0 } else { h } * 60.0;
-                    Value::Tuple(vec![Value::Number(h), Value::Number(s), Value::Number(l)])
-                }
-            }
-            "hsl_to_rgb" => {
-                let h = num!(0) / 360.0;
-                let s = num!(1);
-                let l = num!(2);
-                let r; let g; let b;
-                if s == 0.0 {
-                    r = l; g = l; b = l;
-                } else {
-                    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
-                    let p = 2.0 * l - q;
-                    let hue_to_rgb = |p: f64, q: f64, mut t: f64| -> f64 {
-                        if t < 0.0 { t += 1.0; }
-                        if t > 1.0 { t -= 1.0; }
-                        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
-                        if t < 1.0 / 2.0 { return q; }
-                        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
-                        p
-                    };
-                    r = hue_to_rgb(p, q, h + 1.0 / 3.0);
-                    g = hue_to_rgb(p, q, h);
-                    b = hue_to_rgb(p, q, h - 1.0 / 3.0);
-                }
-                Value::Tuple(vec![
-                    Value::Number((r * 255.0).round()),
-                    Value::Number((g * 255.0).round()),
-                    Value::Number((b * 255.0).round()),
-                ])
-            }
-            "lerp_color" => {
-                let c1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let c2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let t = num!(2);
-                if c1.len() >= 3 && c2.len() >= 3 {
-                    let r = c1[0].as_number().unwrap_or(0.0) * (1.0 - t) + c2[0].as_number().unwrap_or(0.0) * t;
-                    let g = c1[1].as_number().unwrap_or(0.0) * (1.0 - t) + c2[1].as_number().unwrap_or(0.0) * t;
-                    let b = c1[2].as_number().unwrap_or(0.0) * (1.0 - t) + c2[2].as_number().unwrap_or(0.0) * t;
-                    Value::Tuple(vec![Value::Number(r), Value::Number(g), Value::Number(b)])
-                } else {
-                    Value::Tuple(vec![])
-                }
-            }
-            "brighten" => {
-                let c = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let amt = num!(1);
-                if c.len() >= 3 {
-                    Value::Tuple(vec![
-                        Value::Number((c[0].as_number().unwrap_or(0.0) + amt * 255.0).clamp(0.0, 255.0)),
-                        Value::Number((c[1].as_number().unwrap_or(0.0) + amt * 255.0).clamp(0.0, 255.0)),
-                        Value::Number((c[2].as_number().unwrap_or(0.0) + amt * 255.0).clamp(0.0, 255.0)),
-                    ])
-                } else { Value::Tuple(vec![]) }
-            }
-            "darken" => {
-                let c = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let amt = num!(1);
-                if c.len() >= 3 {
-                    Value::Tuple(vec![
-                        Value::Number((c[0].as_number().unwrap_or(0.0) - amt * 255.0).clamp(0.0, 255.0)),
-                        Value::Number((c[1].as_number().unwrap_or(0.0) - amt * 255.0).clamp(0.0, 255.0)),
-                        Value::Number((c[2].as_number().unwrap_or(0.0) - amt * 255.0).clamp(0.0, 255.0)),
-                    ])
-                } else { Value::Tuple(vec![]) }
-            }
-            "saturate" => {
-                let c = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let amt = num!(1);
-                if c.len() >= 3 {
-                    let r = c[0].as_number().unwrap_or(0.0);
-                    let g = c[1].as_number().unwrap_or(0.0);
-                    let b = c[2].as_number().unwrap_or(0.0);
-                    let gray = (r + g + b) / 3.0;
-                    Value::Tuple(vec![
-                        Value::Number(gray + (r - gray) * (1.0 + amt)),
-                        Value::Number(gray + (g - gray) * (1.0 + amt)),
-                        Value::Number(gray + (b - gray) * (1.0 + amt)),
-                    ])
-                } else { Value::Tuple(vec![]) }
-            }
-            "bool" => match &args.get(0) {
-                Some(Value::Number(n)) => Value::Bool(*n != 0.0),
-                Some(Value::Bool(b)) => Value::Bool(*b),
-                _ => Value::Bool(true),
-            },
-            "len" => {
-                let n = match &args.get(0) {
-                    Some(Value::Tuple(t)) => t.len(),
-                    Some(Value::Array(a)) => a.borrow().len(),
-                    Some(Value::Dict(d)) => d.borrow().len(),
-                    Some(Value::String(s)) => s.len(),
-                    _ => 0,
+            Stmt::Seed(e, pos) => {
+                let v = self.eval(e, env)?;
+                let bits = match v {
+                    Value::Num(n) => n.to_bits(),
+                    _ => return Err(VglError::new("seed 需要数字", *pos)),
                 };
-                Value::Number(n as f64)
+                self.rng = Rng::new(bits);
+                self.perm = seeded_perm(bits);
+                Ok(Control::Normal)
             }
-            "push" => {
-                if let Some(Value::Array(arr)) = args.get(0) {
-                    if let Some(v) = args.get(1) {
-                        arr.borrow_mut().push(v.clone());
-                    }
-                }
-                Value::None
-            }
-            "pop" => {
-                if let Some(Value::Array(arr)) = args.get(0) {
-                    arr.borrow_mut().pop().unwrap_or(Value::None)
-                } else {
-                    Value::None
-                }
-            }
-            "array" => {
-                if args.is_empty() {
-                    Value::Array(Rc::new(RefCell::new(Vec::new())))
-                } else if args.len() == 1 {
-                    match &args[0] {
-                        Value::Number(n) => Value::Array(Rc::new(RefCell::new(vec![Value::None; *n as usize]))),
-                        _ => Value::Array(Rc::new(RefCell::new(args.to_vec()))),
-                    }
-                } else {
-                    Value::Array(Rc::new(RefCell::new(args.to_vec())))
-                }
-            }
-            "dict" => {
-                let mut d: HashMap<String, Value> = HashMap::new();
-                let mut i = 0;
-                while i + 1 < args.len() {
-                    let key = args[i].as_string().unwrap_or_else(|| format!("{:?}", args[i]));
-                    d.insert(key, args[i + 1].clone());
-                    i += 2;
-                }
-                Value::Dict(Rc::new(RefCell::new(d)))
-            }
-            "keys" => {
-                if let Some(Value::Dict(d)) = args.get(0) {
-                    let keys: Vec<Value> = d.borrow().keys().map(|k| Value::String(k.clone())).collect();
-                    Value::Array(Rc::new(RefCell::new(keys)))
-                } else {
-                    Value::Array(Rc::new(RefCell::new(Vec::new())))
-                }
-            }
-            "values" => {
-                if let Some(Value::Dict(d)) = args.get(0) {
-                    let vals: Vec<Value> = d.borrow().values().cloned().collect();
-                    Value::Array(Rc::new(RefCell::new(vals)))
-                } else {
-                    Value::Array(Rc::new(RefCell::new(Vec::new())))
-                }
-            }
-            "has" => {
-                if let Some(Value::Dict(d)) = args.get(0) {
-                    let key = args.get(1).and_then(|v| v.as_string()).unwrap_or_default();
-                    Value::Bool(d.borrow().contains_key(&key))
-                } else {
-                    Value::Bool(false)
-                }
-            }
-            // v0.7 字符串函数
-            "str" => {
-                let s = match args.get(0) {
-                    Some(v) => self.value_to_string(v),
-                    None => "".to_string(),
-                };
-                Value::String(s)
-            }
-            "concat" => {
-                let mut s = String::new();
-                for a in args {
-                    if let Some(Value::String(t)) = Some(a) {
-                        s.push_str(t);
-                    } else {
-                        s.push_str(&format!("{:?}", a));
-                    }
-                }
-                Value::String(s)
-            }
-            "substr" => {
-                let s = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
-                let start = num!(1) as usize;
-                let len = num!(2) as usize;
-                let end = (start + len).min(s.len());
-                Value::String(s[start.min(s.len())..end].to_string())
-            }
-            "upper" => {
-                let s = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
-                Value::String(s.to_uppercase())
-            }
-            "lower" => {
-                let s = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
-                Value::String(s.to_lowercase())
-            }
-            "find" => {
-                let s = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
-                let sub = args.get(1).and_then(|v| v.as_string()).unwrap_or_default();
-                Value::Number(s.find(&sub).map(|i| i as f64).unwrap_or(-1.0))
-            }
-            // v0.75 材质库预设
-            "preset" => {
-                let name = args.get(0).and_then(|v| v.as_string()).unwrap_or_default();
-                let mut m = HashMap::new();
-                match name.as_str() {
-                    "watercolor" => {
-                        // 水彩：柔和、半透明、轻微噪声
-                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(180.0), Value::Number(200.0), Value::Number(220.0)]));
-                        m.insert("noise".to_string(), Value::Number(0.15));
-                        m.insert("alpha".to_string(), Value::Number(0.6));
-                    }
-                    "oil_painting" => {
-                        // 油画：厚重、不透明、中等噪声
-                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(150.0), Value::Number(100.0), Value::Number(80.0)]));
-                        m.insert("noise".to_string(), Value::Number(0.3));
-                        m.insert("alpha".to_string(), Value::Number(1.0));
-                    }
-                    "pencil_sketch" => {
-                        // 铅笔素描：灰度、高噪声、半透明
-                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(60.0), Value::Number(60.0), Value::Number(60.0)]));
-                        m.insert("noise".to_string(), Value::Number(0.5));
-                        m.insert("alpha".to_string(), Value::Number(0.7));
-                    }
-                    "ink_wash" => {
-                        // 水墨：黑色、低噪声、半透明
-                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(20.0), Value::Number(20.0), Value::Number(30.0)]));
-                        m.insert("noise".to_string(), Value::Number(0.08));
-                        m.insert("alpha".to_string(), Value::Number(0.8));
-                    }
-                    "neon" => {
-                        // 霓虹：亮色、无噪声、不透明
-                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(255.0), Value::Number(50.0), Value::Number(200.0)]));
-                        m.insert("noise".to_string(), Value::Number(0.0));
-                        m.insert("alpha".to_string(), Value::Number(1.0));
-                    }
-                    "metal" => {
-                        // 金属：灰度、中等噪声、不透明
-                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(180.0), Value::Number(180.0), Value::Number(190.0)]));
-                        m.insert("noise".to_string(), Value::Number(0.2));
-                        m.insert("alpha".to_string(), Value::Number(1.0));
-                    }
-                    "pastel" => {
-                        // 粉彩：柔和色、轻噪声、半透明
-                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(255.0), Value::Number(180.0), Value::Number(200.0)]));
-                        m.insert("noise".to_string(), Value::Number(0.1));
-                        m.insert("alpha".to_string(), Value::Number(0.75));
-                    }
-                    "airbrush" => {
-                        // 喷枪：任意色、低噪声、低透明度
-                        m.insert("color".to_string(), Value::Tuple(vec![Value::Number(100.0), Value::Number(150.0), Value::Number(255.0)]));
-                        m.insert("noise".to_string(), Value::Number(0.05));
-                        m.insert("alpha".to_string(), Value::Number(0.4));
-                    }
-                    _ => {
+            Stmt::Render(e, pos) => {
+                let v = self.eval(e, env)?;
+                let fname = match v {
+                    Value::Str(s) => s,
+                    other => {
                         return Err(VglError::new(
-                            format!("未知材质预设: '{}'（可用: watercolor/oil_painting/pencil_sketch/ink_wash/neon/metal/pastel/airbrush）", name),
-                            self.current_pos,
-                        ));
+                            format!("render 需要 SVG 文件名字符串，得到 {}", other.type_name()),
+                            *pos,
+                        ))
                     }
-                }
-                Value::Material(m)
-            }
-            "line" => {
-                let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                Value::Path("line".into(), vec![Value::Tuple(p1), Value::Tuple(p2)])
-            }
-            "circle" => {
-                let cx = num!(0) as i32;
-                let cy = num!(1) as i32;
-                let r = num!(2) as i32;
-                Value::Path("circle".into(), vec![Value::Number(cx as f64), Value::Number(cy as f64), Value::Number(r as f64)])
-            }
-            // v0.75 新增绘图原语
-            "rect" => {
-                let x = num!(0);
-                let y = num!(1);
-                let w = num!(2);
-                let h = num!(3);
-                Value::Path("rect".into(), vec![Value::Number(x), Value::Number(y), Value::Number(w), Value::Number(h)])
-            }
-            "ellipse" => {
-                let cx = num!(0);
-                let cy = num!(1);
-                let rx = num!(2);
-                let ry = num!(3);
-                Value::Path("ellipse".into(), vec![Value::Number(cx), Value::Number(cy), Value::Number(rx), Value::Number(ry)])
-            }
-            "arc" => {
-                let cx = num!(0);
-                let cy = num!(1);
-                let r = num!(2);
-                let start = num!(3);
-                let end = num!(4);
-                Value::Path("arc".into(), vec![Value::Number(cx), Value::Number(cy), Value::Number(r), Value::Number(start), Value::Number(end)])
-            }
-            "polygon" => {
-                // polygon(p1, p2, p3, ...) - 任意数量点
-                Value::Path("polygon".into(), args.to_vec())
-            }
-            "triangle" => {
-                let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let p3 = args.get(2).and_then(|v| v.as_tuple()).unwrap_or_default();
-                Value::Path("triangle".into(), vec![Value::Tuple(p1), Value::Tuple(p2), Value::Tuple(p3)])
-            }
-            "bezier" => {
-                let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let p3 = args.get(2).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let p4 = args.get(3).and_then(|v| v.as_tuple()).unwrap_or_default();
-                Value::Path("bezier".into(), vec![Value::Tuple(p1), Value::Tuple(p2), Value::Tuple(p3), Value::Tuple(p4)])
-            }
-            "qbezier" => {
-                let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let p3 = args.get(2).and_then(|v| v.as_tuple()).unwrap_or_default();
-                Value::Path("qbezier".into(), vec![Value::Tuple(p1), Value::Tuple(p2), Value::Tuple(p3)])
-            }
-            "path" => {
-                if let Some(Value::Array(arr)) = args.get(0) {
-                    let pts = arr.borrow().clone();
-                    Value::Path("polyline".into(), pts)
-                } else {
-                    Value::None
-                }
-            }
-            "dot" => {
-                let a = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let b = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let sum: f64 = a.iter().zip(b.iter())
-                    .map(|(x, y)| x.as_number().unwrap_or(0.0) * y.as_number().unwrap_or(0.0))
-                    .sum();
-                Value::Number(sum)
-            }
-            "length" => {
-                let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                let d = if p1.len() >= 2 && p2.len() >= 2 {
-                    let dx = p1[0].as_number().unwrap_or(0.0) - p2[0].as_number().unwrap_or(0.0);
-                    let dy = p1[1].as_number().unwrap_or(0.0) - p2[1].as_number().unwrap_or(0.0);
-                    (dx * dx + dy * dy).sqrt()
-                } else {
-                    0.0
                 };
-                Value::Number(d)
-            }
-            "perlin" => {
-                let v = if let Some(perm) = &self.noise_perm {
-                    perlin_seeded(num!(0), num!(1), perm)
-                } else {
-                    perlin(num!(0), num!(1))
-                };
-                Value::Number(v)
-            }
-            "worley" => Value::Number(worley(num!(0), num!(1))),
-            "fbm" => {
-                let o = args.get(2).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(4);
-                Value::Number(fbm(num!(0), num!(1), o))
-            }
-            "load" => {
-                let path = match args.get(0) {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err(VglError::new("load 需要字符串路径参数", self.current_pos)),
-                };
-                let full = if Path::new(&path).is_absolute() {
-                    path.clone()
-                } else {
-                    format!("{}/{}", self.current_dir, path)
-                };
-                let img = image::open(&full).map_err(|e| {
-                    VglError::new(format!("load 失败: {} ({})", path, e), self.current_pos)
-                })?;
-                let rgb = img.to_rgb8();
-                let (w, h) = (rgb.width(), rgb.height());
-                let mut canvas = Canvas::new(w, h);
-                for y in 0..h {
-                    for x in 0..w {
-                        let px = rgb.get_pixel(x, y);
-                        let idx = (y * w + x) as usize * 4;
-                        canvas.pixels[idx] = px[0] as f32;
-                        canvas.pixels[idx + 1] = px[1] as f32;
-                        canvas.pixels[idx + 2] = px[2] as f32;
-                        canvas.pixels[idx + 3] = 255.0;
-                    }
-                }
-                Value::Image(Rc::new(canvas))
-            }
-            "pixel_at" => {
-                // pixel_at(img, x, y) → (r, g, b) 元组
-                let img_val = args.get(0).cloned().unwrap_or(Value::None);
-                let x = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                let y = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                match img_val {
-                    Value::Image(c) => {
-                        if x < 0 || y < 0 || x as u32 >= c.width || y as u32 >= c.height {
-                            return Err(VglError::new(
-                                format!("pixel_at 坐标越界: ({}, {})", x, y),
-                                self.current_pos,
-                            ));
-                        }
-                        let idx = (y as u32 * c.width + x as u32) as usize * 4;
-                        Value::Tuple(vec![
-                            Value::Number(c.pixels[idx] as f64),
-                            Value::Number(c.pixels[idx + 1] as f64),
-                            Value::Number(c.pixels[idx + 2] as f64),
-                        ])
-                    }
-                    _ => return Err(VglError::new("pixel_at 需要 image 参数", self.current_pos)),
-                }
-            }
-            // v1.0: 画布尺寸查询（语义化标准库依赖）
-            "width" => {
-                Value::Number(self.canvas.as_ref().map(|c| c.width as f64).unwrap_or(0.0))
-            }
-            "height" => {
-                Value::Number(self.canvas.as_ref().map(|c| c.height as f64).unwrap_or(0.0))
-            }
-            // v1.0: color() 语义化颜色构造器
-            "color" => {
-                let r = num!(0);
-                let g = num!(1);
-                let b = num!(2);
-                let a = args.get(3).and_then(|v| v.as_number()).unwrap_or(255.0);
-                Value::Tuple(vec![Value::Number(r), Value::Number(g), Value::Number(b), Value::Number(a)])
-            }
-            _ => return Ok(None),
-        };
-        Ok(Some(v))
-    }
-
-    pub fn exec(&mut self, sp: &StmtWithPos, env: Rc<RefCell<Env>>) -> ExecResult {
-        // 更新当前语句位置（运行时错误定位）
-        self.current_pos = Some(sp.pos);
-        let stmt = &sp.stmt;
-        match stmt {
-            Stmt::Canvas(w, h) => {
-                self.canvas = Some(Canvas::new(*w, *h));
+                self.render_to(&fname, *pos)?;
                 Ok(Control::Normal)
             }
-            Stmt::Bg(expr) => {
-                if self.bg_set {
-                    self.warn("重复设置背景色");
-                } else {
-                    self.bg_set = true;
+            Stmt::Let { name, expr, .. } => {
+                let v = self.eval(expr, env.clone())?;
+                Env::define(&env, name, v);
+                Ok(Control::Normal)
+            }
+            Stmt::FnDef(f) => {
+                let def = Rc::new(FnDef {
+                    name: f.name.clone(),
+                    params: f.params.clone(),
+                    body: f.body.clone(),
+                    env: env.clone(),
+                    pos: f.pos,
+                });
+                Env::define(&env, &f.name, Value::Fn(def));
+                Ok(Control::Normal)
+            }
+            Stmt::If { branches, else_body, .. } => {
+                for (cond, body) in branches {
+                    let c = self.eval(cond, env.clone())?;
+                    if self.truthy(c, cond.pos())? {
+                        return self.exec_block(body, env);
+                    }
                 }
-                let val = self.eval(expr, env.clone())?;
-                let (r, g, b) = match val {
-                    Value::Color(r, g, b, _a) => (r as f32, g as f32, b as f32),
-                    Value::Tuple(t) => {
-                        if t.len() >= 3 {
-                            (
-                                clamp_f32(t[0].as_number().unwrap_or(0.0) as f32),
-                                clamp_f32(t[1].as_number().unwrap_or(0.0) as f32),
-                                clamp_f32(t[2].as_number().unwrap_or(0.0) as f32),
-                            )
-                        } else {
-                            return Err(VglError::new("bg 需要三元组", self.current_pos));
-                        }
-                    }
-                    _ => {
-                        let _ = self.eval_error("bg 需要颜色")?;
-                        unreachable!()
-                    }
-                };
-                if let Some(canvas) = &mut self.canvas {
-                    canvas.fill(r, g, b);
-                    canvas.bg = (r, g, b, 255.0);
+                if let Some(body) = else_body {
+                    return self.exec_block(body, env);
                 }
                 Ok(Control::Normal)
             }
-            Stmt::Let(name, expr) => {
-                let val = self.eval(expr, env.clone())?;
-                env.borrow_mut().vars.insert(name.clone(), val);
-                Ok(Control::Normal)
-            }
-            // v1.0: 元组解构 let (a, b, c) = expr
-            Stmt::LetDestruct(names, expr) => {
-                let val = self.eval(expr, env.clone())?;
-                let items = match &val {
-                    Value::Tuple(t) => t.clone(),
-                    Value::Array(arr) => arr.borrow().clone(),
-                    _ => return Err(VglError::new(
-                        format!("解构需要元组或数组，得到 {:?}", val),
-                        self.current_pos,
-                    )),
-                };
-                for (i, name) in names.iter().enumerate() {
-                    if let Some(v) = items.get(i) {
-                        env.borrow_mut().vars.insert(name.clone(), v.clone());
-                    } else {
-                        env.borrow_mut().vars.insert(name.clone(), Value::None);
+            Stmt::ForRange { var, start, end, step, body, pos } => {
+                let sv = self.eval(start, env.clone())?;
+                let ev = self.eval(end, env.clone())?;
+                let s = self.num(sv, *pos, "range 起点")?;
+                let e = self.num(ev, *pos, "range 终点")?;
+                let st = match step {
+                    Some(x) => {
+                        let xv = self.eval(x, env.clone())?;
+                        self.num(xv, *pos, "range 步长")?
                     }
-                }
-                Ok(Control::Normal)
-            }
-            // v0.9: const 不可变绑定，记录到 consts 防止后续修改
-            Stmt::ConstDef(name, expr) => {
-                let val = self.eval(expr, env.clone())?;
-                let mut env_ref = env.borrow_mut();
-                env_ref.vars.insert(name.clone(), val);
-                env_ref.consts.insert(name.clone());
-                Ok(Control::Normal)
-            }
-            Stmt::Assign(name, expr) => {
-                let val = self.eval(expr, env.clone())?;
-                if let Err(e) = env.borrow_mut().set(name, val) {
-                    self.eval_error(&e)?;
-                }
-                Ok(Control::Normal)
-            }
-            Stmt::For(var, start, end, step, body, label) => {
-                let start_val = self.eval(start, env.clone())?;
-                let end_val = self.eval(end, env.clone())?;
-                let step_val = if let Some(se) = step {
-                    self.eval(se, env.clone())?.as_number().unwrap_or(1.0)
-                } else {
-                    1.0
+                    None => 1.0,
                 };
-                let mut i = start_val.as_number().unwrap_or(0.0);
-                let end = end_val.as_number().unwrap_or(0.0);
-                while i < end {
-                    let block_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-                    block_env.borrow_mut().vars.insert(var.clone(), Value::Number(i));
-                    match self.execute_block(body, block_env)? {
-                        Control::Normal => {}
-                        Control::Continue => {}
-                        Control::Break(None) => break,
-                        Control::Break(Some(l)) => {
-                            if label.as_deref() == Some(l.as_str()) {
-                                break;
-                            } else {
-                                return Ok(Control::Break(Some(l)));
-                            }
-                        }
-                        Control::Return(v) => return Ok(Control::Return(v)),
-                    }
-                    i += step_val;
+                if st == 0.0 {
+                    return Err(VglError::new("for 步长不能为 0", *pos));
                 }
-                Ok(Control::Normal)
-            }
-            // v0.8: for-in-array 遍历
-            Stmt::ForIn(var, arr_expr, body, label) => {
-                let arr_val = self.eval(arr_expr, env.clone())?;
-                let items = match arr_val {
-                    Value::Array(arr) => arr.borrow().clone(),
-                    Value::Tuple(t) => t,
-                    _ => return Err(VglError::new("for-in 需要数组或元组", self.current_pos)),
-                };
-                for item in items {
-                    let block_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-                    block_env.borrow_mut().vars.insert(var.clone(), item);
-                    match self.execute_block(body, block_env)? {
-                        Control::Normal => {}
-                        Control::Continue => {}
-                        Control::Break(None) => break,
-                        Control::Break(Some(l)) => {
-                            // 匹配 label：若匹配则终止本循环，否则向上传播
-                            if label.as_deref() == Some(l.as_str()) {
-                                break;
-                            } else {
-                                return Ok(Control::Break(Some(l)));
-                            }
-                        }
-                        Control::Return(v) => return Ok(Control::Return(v)),
-                    }
-                }
-                Ok(Control::Normal)
-            }
-            Stmt::While(cond, body, label) => {
+                let mut i = s;
                 loop {
-                    let cond_val = self.eval(cond, env.clone())?;
-                    let b = match cond_val {
-                        Value::Bool(b) => b,
-                        Value::Number(n) => n != 0.0,
-                        _ => false,
-                    };
-                    if !b {
+                    if st > 0.0 && i >= e {
                         break;
                     }
-                    let block_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-                    match self.execute_block(body, block_env)? {
-                        Control::Normal => {}
-                        Control::Continue => {}
-                        Control::Break(None) => break,
-                        Control::Break(Some(l)) => {
-                            if label.as_deref() == Some(l.as_str()) {
-                                break;
-                            } else {
-                                return Ok(Control::Break(Some(l)));
-                            }
-                        }
+                    if st < 0.0 && i <= e {
+                        break;
+                    }
+                    let scope = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
+                    Env::define(&scope, var, Value::Num(i));
+                    match self.exec_block(body, scope)? {
+                        Control::Break => break,
                         Control::Return(v) => return Ok(Control::Return(v)),
+                        _ => {}
                     }
+                    i += st;
                 }
                 Ok(Control::Normal)
             }
-            Stmt::If(cond, then_body, else_body) => {
-                let cond_val = self.eval(cond, env.clone())?;
-                let b = match cond_val {
-                    Value::Bool(b) => b,
-                    Value::Number(n) => n != 0.0,
-                    _ => false,
-                };
-                if b {
-                    let block_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-                    self.execute_block(then_body, block_env)
-                } else if let Some(eb) = else_body {
-                    let block_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-                    self.execute_block(eb, block_env)
-                } else {
-                    Ok(Control::Normal)
-                }
-            }
-            Stmt::Break(_) => {
-                // break 在 parse 期已校验 loop_depth
-                let label = if let Stmt::Break(l) = stmt { l.clone() } else { None };
-                Ok(Control::Break(label))
-            }
-            Stmt::Continue => Ok(Control::Continue),
-            Stmt::Seed(n) => {
-                *self.rng.borrow_mut() = StdRng::seed_from_u64(*n);
-                // v0.8 同步生成噪声置换表，使 seed 也影响 perlin/worley/fbm
-                self.noise_perm = Some(crate::noise::seeded_perm(*n));
-                Ok(Control::Normal)
-            }
-            Stmt::FnDef(name, params, body) => {
-                if let Some(Value::Closure(_, _, _, _)) = env.borrow().get(name) {
-                    self.warn(format!("函数 {} 被覆盖", name));
-                }
-                let closure = Value::Closure(name.clone(), params.clone(), body.clone(), env.clone());
-                env.borrow_mut().vars.insert(name.clone(), closure);
-                Ok(Control::Normal)
-            }
-            Stmt::Return(expr) => {
-                let val = self.eval(expr, env.clone())?;
-                Ok(Control::Return(val))
-            }
-            Stmt::Pixel(x_expr, y_expr, rgb_expr) => {
-                let x = self.eval(x_expr, env.clone())?.as_number().unwrap_or(0.0);
-                let y = self.eval(y_expr, env.clone())?.as_number().unwrap_or(0.0);
-                let rgb_val = self.eval(rgb_expr, env.clone())?;
-                // v0.9: Color 携带 alpha，tuple 默认不透明
-                let (r, g, b, a) = match rgb_val {
-                    Value::Color(r, g, b, a) => (r as f32, g as f32, b as f32, a as f32),
-                    Value::Tuple(t) => (
-                        clamp_f32(t.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                        clamp_f32(t.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                        clamp_f32(t.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                        255.0,
-                    ),
+            Stmt::ForIn { var, arr, body, pos } => {
+                let v = self.eval(arr, env.clone())?;
+                let items = match &v {
+                    Value::Arr(a) => a.borrow().clone(),
                     _ => {
-                        let _ = self.eval_error("rgb 需要颜色或三元组")?;
-                        unreachable!()
+                        return Err(VglError::new(
+                            format!("for-in 需要数组，得到 {}", v.type_name()),
+                            *pos,
+                        ))
                     }
                 };
-                // v0.8 应用变换
-                let (tx, ty) = self.current_transform().apply(x, y);
-                let px = tx.round() as i32;
-                let py = ty.round() as i32;
-                // v0.8 裁剪检查
-                if self.is_clipped(px, py) {
-                    return Ok(Control::Normal);
-                }
-                if let Some(canvas) = &mut self.canvas {
-                    // v0.9: alpha < 255 时走 source-over 合成
-                    canvas.put_pixel_rgba(px, py, r, g, b, a);
-                }
-                Ok(Control::Normal)
-            }
-            Stmt::Stroke(fields) => self.exec_stroke(fields, env),
-            Stmt::Render(fname) => {
-                if let Some(canvas) = &self.canvas {
-                    // 自动创建输出目录
-                    if let Some(parent) = Path::new(fname).parent() {
-                        if !parent.as_os_str().is_empty() {
-                            let _ = fs::create_dir_all(parent);
-                        }
-                    }
-                    // f32 RGBA → u8 RGB（丢弃 alpha，背景已合成）
-                    // v0.9: 线性工作流模式下，渲染时将线性值转回 sRGB
-                    let mut rgb_bytes = Vec::with_capacity((canvas.width * canvas.height * 3) as usize);
-                    for i in (0..canvas.pixels.len()).step_by(4) {
-                        let (r, g, b) = if canvas.linear_mode {
-                            (
-                                crate::canvas::linear_to_srgb(canvas.pixels[i]) as f64,
-                                crate::canvas::linear_to_srgb(canvas.pixels[i + 1]) as f64,
-                                crate::canvas::linear_to_srgb(canvas.pixels[i + 2]) as f64,
-                            )
-                        } else {
-                            (canvas.pixels[i] as f64, canvas.pixels[i + 1] as f64, canvas.pixels[i + 2] as f64)
-                        };
-                        rgb_bytes.push(clamp_u8(r));
-                        rgb_bytes.push(clamp_u8(g));
-                        rgb_bytes.push(clamp_u8(b));
-                    }
-                    let img = ImageBuffer::<Rgb<u8>, _>::from_vec(
-                        canvas.width,
-                        canvas.height,
-                        rgb_bytes,
-                    )
-                    .ok_or_else(|| VglError::new("渲染缓冲区创建失败", self.current_pos))?;
-                    img.save(fname).map_err(|e| {
-                        eprintln!("渲染失败: {}", e);
-                        VglError::new(format!("渲染失败: {}", e), self.current_pos)
-                    })?;
-                    println!("已渲染: {} ({}x{})", fname, canvas.width, canvas.height);
-                }
-                Ok(Control::Normal)
-            }
-            Stmt::StructDef(name, fields) => {
-                let mut def_names = Vec::new();
-                let mut def_vals = Vec::new();
-                for (fname, expr) in fields {
-                    def_names.push(fname.clone());
-                    def_vals.push(self.eval(expr, env.clone())?);
-                }
-                self.struct_defs.insert(name.clone(), (def_names, def_vals));
-                Ok(Control::Normal)
-            }
-            Stmt::Import(path) => self.do_import(path, env),
-            Stmt::MaterialDef(name, fields) => {
-                let mut map = HashMap::new();
-                for (k, v) in fields {
-                    map.insert(k.clone(), self.eval(v, env.clone())?);
-                }
-                let mat = Value::Material(map);
-                env.borrow_mut().vars.insert(name.clone(), mat);
-                Ok(Control::Normal)
-            }
-            Stmt::LayerDef(name, body) => self.exec_layer(name, body, env),
-            Stmt::FieldDef(name, params, body) => {
-                let closure = Value::Closure(name.clone(), params.clone(), body.clone(), env.clone());
-                env.borrow_mut().vars.insert(name.clone(), closure);
-                Ok(Control::Normal)
-            }
-            Stmt::IndexAssign(base, idx, expr) => {
-                let base_val = self.eval(base, env.clone())?;
-                let idx_val = self.eval(idx, env.clone())?;
-                let val = self.eval(expr, env.clone())?;
-                match base_val {
-                    Value::Array(arr) => {
-                        let i = idx_val.as_number().unwrap_or(0.0) as usize;
-                        let mut arr_ref = arr.borrow_mut();
-                        if i < arr_ref.len() {
-                            arr_ref[i] = val;
-                            Ok(Control::Normal)
-                        } else {
-                            self.eval_error("索引越界")
-                        }
-                    }
-                    Value::Dict(d) => {
-                        let key = idx_val.as_string().unwrap_or_default();
-                        d.borrow_mut().insert(key, val);
-                        Ok(Control::Normal)
-                    }
-                    Value::Struct(s) => {
-                        let field = idx_val.as_string().unwrap_or_default();
-                        s.borrow_mut().insert(field, val);
-                        Ok(Control::Normal)
-                    }
-                    _ => self.eval_error("索引赋值不支持该类型"),
-                }
-            }
-            Stmt::FieldAssign(obj, field, expr) => {
-                let obj_val = self.eval(obj, env.clone())?;
-                let val = self.eval(expr, env.clone())?;
-                match obj_val {
-                    Value::Struct(s) => {
-                        let mut s_ref = s.borrow_mut();
-                        s_ref.insert(field.clone(), val);
-                        Ok(Control::Normal)
-                    }
-                    // v0.9: instance 字段赋值
-                    Value::Instance(data) => {
-                        let mut d_ref = data.borrow_mut();
-                        d_ref.fields.insert(field.clone(), val);
-                        Ok(Control::Normal)
-                    }
-                    _ => self.eval_error("字段赋值目标不是结构体/实例"),
-                }
-            }
-            // v0.9: match/case 模式匹配
-            Stmt::Match(scrutinee, cases, default) => {
-                let val = self.eval(scrutinee, env.clone())?;
-                for (pattern, body) in cases {
-                    let pat_val = self.eval(pattern, env.clone())?;
-                    if val == pat_val {
-                        let child = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-                        for sp in body {
-                            let ctrl = self.exec(sp, child.clone())?;
-                            match ctrl {
-                                Control::Normal => {}
-                                other => return Ok(other),
-                            }
-                        }
-                        return Ok(Control::Normal);
-                    }
-                }
-                // 无 case 匹配，执行 default
-                if let Some(body) = default {
-                    let child = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-                    for sp in body {
-                        let ctrl = self.exec(sp, child.clone())?;
-                        match ctrl {
-                            Control::Normal => {}
-                            other => return Ok(other),
-                        }
+                for item in items {
+                    let scope = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
+                    Env::define(&scope, var, item);
+                    match self.exec_block(body, scope)? {
+                        Control::Break => break,
+                        Control::Return(v) => return Ok(Control::Return(v)),
+                        _ => {}
                     }
                 }
                 Ok(Control::Normal)
             }
-            // v0.9: enum 枚举定义
-            Stmt::EnumDef(name, variants) => {
-                let mut vmap = HashMap::new();
-                for (vname, arity) in variants {
-                    vmap.insert(vname.clone(), *arity);
-                }
-                let mut env_ref = env.borrow_mut();
-                env_ref.vars.insert(name.clone(), Value::EnumDef(name.clone(), vmap));
-                Ok(Control::Normal)
-            }
-            // v0.9: class 类定义
-            Stmt::ClassDef(name, parent, fields, methods) => {
-                let mut method_map = HashMap::new();
-                for m in methods {
-                    if let Stmt::FnDef(mname, params, body) = &m.stmt {
-                        method_map.insert(mname.clone(), (params.clone(), body.clone()));
+            Stmt::While(cond, body, _) => {
+                loop {
+                    let c = self.eval(cond, env.clone())?;
+                    if !self.truthy(c, cond.pos())? {
+                        break;
+                    }
+                    let scope = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
+                    match self.exec_block(body, scope)? {
+                        Control::Break => break,
+                        Control::Return(v) => return Ok(Control::Return(v)),
+                        _ => {}
                     }
                 }
-                let class_data = Rc::new(crate::ast::ClassData {
-                    name: name.clone(),
-                    parent: parent.clone(),
-                    fields: fields.clone(),
-                    methods: method_map,
-                });
-                self.class_defs.insert(name.clone(), class_data.clone());
-                let mut env_ref = env.borrow_mut();
-                env_ref.vars.insert(name.clone(), Value::Class(class_data));
                 Ok(Control::Normal)
             }
-            // v0.9: module 模块定义
-            Stmt::ModuleDef(name, body) => {
-                let mod_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-                for sp in body {
-                    let ctrl = self.exec(sp, mod_env.clone())?;
-                    match ctrl {
-                        Control::Normal => {}
-                        other => return Ok(other),
-                    }
-                }
-                let mut env_ref = env.borrow_mut();
-                env_ref.vars.insert(name.clone(), Value::Module(name.clone(), mod_env));
-                Ok(Control::Normal)
+            Stmt::Return(e, _) => {
+                let v = match e {
+                    Some(x) => self.eval(x, env)?,
+                    None => Value::None,
+                };
+                Ok(Control::Return(v))
             }
-            // v0.9: from import — 从模块导入指定项
-            Stmt::FromImport(mod_name, items) => {
-                let mod_val = env.borrow().get(mod_name);
-                match mod_val {
-                    Some(Value::Module(_, mod_env)) => {
-                        for item in items {
-                            if let Some(v) = mod_env.borrow().get(item) {
-                                env.borrow_mut().vars.insert(item.clone(), v);
-                            } else {
-                                return Err(VglError::new(
-                                    format!("模块 {} 中无此项: {}", mod_name, item),
-                                    self.current_pos,
-                                ));
-                            }
-                        }
-                        Ok(Control::Normal)
-                    }
-                    _ => Err(VglError::new(format!("{} 不是模块", mod_name), self.current_pos)),
+            Stmt::Break(_) => Ok(Control::Break),
+            Stmt::Continue(_) => Ok(Control::Continue),
+            Stmt::Group { named, body, pos } => {
+                let mut named_v = Vec::new();
+                for (name, e, p) in named {
+                    named_v.push((name.clone(), self.eval(e, env.clone())?, *p));
                 }
+                let g = self.build_group(&mut named_v, *pos)?;
+                self.scene.open_group(g);
+                let r = self.exec_block(body, env);
+                self.scene.close_group();
+                r
             }
-            Stmt::ExprStmt(expr) => {
-                self.eval(expr, env.clone())?;
+            Stmt::Expr(e) => {
+                self.eval(e, env)?;
                 Ok(Control::Normal)
             }
         }
     }
 
-    /// 辅助：产生 VglError 并打印后退出。返回类型为 ExecResult 以便在 exec 中用 ? 传播。
-    /// 实际上它直接 std::process::exit，返回值仅为满足类型检查。
-    /// v0.8 错误恢复：不再直接 exit，而是返回 VglError 由上层处理
-    pub fn eval_error(&self, msg: &str) -> Result<Control, VglError> {
-        Err(VglError::new(msg, self.current_pos))
-    }
-
-    pub fn exec_stroke(&mut self, fields: &HashMap<String, Expr>, env: Rc<RefCell<Env>>) -> ExecResult {
-        // v0.4 块作用域：stroke 块创建子 Environment
-        let block_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-        let path_val = self.eval(
-            fields.get("path").unwrap_or(&Expr::Ident("none".into())),
-            block_env.clone(),
-        )?;
-        // v0.8 应用变换到 Path 的坐标参数
-        let path_val = if let Value::Path(tag, args) = &path_val {
-            let t = self.current_transform().clone();
-            let new_args: Vec<Value> = args.iter().map(|v| {
-                if let Value::Tuple(tup) = v {
-                    if tup.len() >= 2 {
-                        let x = tup[0].as_number().unwrap_or(0.0);
-                        let y = tup[1].as_number().unwrap_or(0.0);
-                        let (nx, ny) = t.apply(x, y);
-                        Value::Tuple(vec![Value::Number(nx), Value::Number(ny)])
-                    } else { v.clone() }
-                } else if let Value::Number(_) = v {
-                    // 标量参数（如 circle 的 radius、rect 的 w/h）不变换
-                    v.clone()
-                } else { v.clone() }
-            }).collect();
-            Value::Path(tag.clone(), new_args)
-        } else {
-            path_val
-        };
-        let width = self
-            .eval(fields.get("width").unwrap_or(&Expr::Number(1.0)), block_env.clone())?
-            .as_number()
-            .unwrap_or(1.0);
-        // v0.5 批次 B：samples 字段支持
-        let samples = fields
-            .get("samples")
-            .map(|e| self.eval(e, block_env.clone()).map(|v| v.as_number().unwrap_or(0.0) as i32))
-            .transpose()?
-            .unwrap_or(0);
-        // v0.9: join 字段支持（miter/bevel/round，仅对 polyline 有效）
-        let join = fields
-            .get("join")
-            .map(|e| self.eval(e, block_env.clone()).map(|v| v.as_string().unwrap_or_else(|| "round".to_string())))
-            .transpose()?
-            .unwrap_or_else(|| "round".to_string());
-        // v0.55 批次 D：材质分支用 _mat 系列方法（逐像素 noise + alpha 集成）
-        if let Some(mat_expr) = fields.get("material") {
-            let mat_val = self.eval(mat_expr, block_env.clone())?;
-            if let Value::Material(mat_map) = mat_val {
-                let base = mat_map.get("color").cloned().unwrap_or(Value::Color(0, 0, 0, 255));
-                let (cr, cg, cb): (f32, f32, f32) = match base {
-                    Value::Color(r, g, b, _a) => (r as f32, g as f32, b as f32),
-                    Value::Tuple(t) => (
-                        clamp_f32(t.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                        clamp_f32(t.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                        clamp_f32(t.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                    ),
-                    _ => (0.0, 0.0, 0.0),
-                };
-                let noise = mat_map.get("noise").and_then(|v| v.as_number()).unwrap_or(0.0);
-                // 材质 alpha 默认 1.0（完全不透明），存为 [0,255]
-                let alpha = mat_map.get("alpha").and_then(|v| v.as_number()).unwrap_or(1.0) as f32 * 255.0;
-                let mat = MaterialParams { r: cr, g: cg, b: cb, noise, alpha };
-                if let Some(canvas) = &mut self.canvas {
-                    match path_val {
-                        Value::Path(tag, args) => match tag.as_str() {
-                            "line" => {
-                                let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                                let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                                canvas.draw_line_mat(
-                                    p1.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                    p1.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                    p2.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                    p2.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                                    width, &mat,
-                                );
-                            }
-                            "circle" => {
-                                let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let rad = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                canvas.draw_circle_mat(cx, cy, rad, width, &mat);
-                            }
-                            "bezier" => {
-                                let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                                let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                                let p3 = args.get(2).and_then(|v| v.as_tuple()).unwrap_or_default();
-                                let p4 = args.get(3).and_then(|v| v.as_tuple()).unwrap_or_default();
-                                let n = if samples > 0 { samples as usize } else { 64 };
-                                let pts = canvas.sample_bezier3(
-                                    (p1.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                                     p1.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                                    (p2.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                                     p2.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                                    (p3.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                                     p3.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                                    (p4.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                                     p4.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                                    n,
-                                );
-                                for i in 0..pts.len().saturating_sub(1) {
-                                    canvas.draw_line_mat(pts[i].0, pts[i].1, pts[i + 1].0, pts[i + 1].1, width, &mat);
-                                }
-                            }
-                            "qbezier" => {
-                                let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                                let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                                let p3 = args.get(2).and_then(|v| v.as_tuple()).unwrap_or_default();
-                                let n = if samples > 0 { samples as usize } else { 32 };
-                                let pts = canvas.sample_bezier2(
-                                    (p1.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                                     p1.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                                    (p2.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                                     p2.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                                    (p3.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                                     p3.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                                    n,
-                                );
-                                for i in 0..pts.len().saturating_sub(1) {
-                                    canvas.draw_line_mat(pts[i].0, pts[i].1, pts[i + 1].0, pts[i + 1].1, width, &mat);
-                                }
-                            }
-                            "polyline" => {
-                                // v0.9: 支持 join 字段（miter/bevel/round）
-                                let pts: Vec<(f64, f64)> = args.iter().filter_map(|v| {
-                                    let t = v.as_tuple()?;
-                                    Some((
-                                        t.get(0).and_then(|x| x.as_number()).unwrap_or(0.0),
-                                        t.get(1).and_then(|y| y.as_number()).unwrap_or(0.0),
-                                    ))
-                                }).collect();
-                                if pts.len() >= 2 {
-                                    canvas.draw_polyline_join_mat(&pts, width, &mat, &join);
-                                }
-                            }
-                            // v0.75 新增 Path 类型（材质分支）
-                            "rect" => {
-                                let x = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let w = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let h = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let x2 = x + w;
-                                let y2 = y + h;
-                                canvas.draw_line_mat(x, y, x2, y, width, &mat);
-                                canvas.draw_line_mat(x2, y, x2, y2, width, &mat);
-                                canvas.draw_line_mat(x2, y2, x, y2, width, &mat);
-                                canvas.draw_line_mat(x, y2, x, y, width, &mat);
-                            }
-                            "ellipse" => {
-                                let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let rx = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0);
-                                let ry = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0);
-                                let steps = ((rx + ry) * 0.5 * std::f64::consts::PI).max(16.0) as usize;
-                                let mut prev: Option<(i32, i32)> = None;
-                                for i in 0..=steps {
-                                    let t = i as f64 / steps as f64 * std::f64::consts::PI * 2.0;
-                                    let px = cx + (t.cos() * rx).round() as i32;
-                                    let py = cy + (t.sin() * ry).round() as i32;
-                                    if let Some((ppx, ppy)) = prev {
-                                        canvas.draw_line_mat(ppx, ppy, px, py, width, &mat);
-                                    }
-                                    prev = Some((px, py));
-                                }
-                            }
-                            "arc" => {
-                                let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                                let rad = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0);
-                                let start = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0);
-                                let end = args.get(4).and_then(|v| v.as_number()).unwrap_or(0.0);
-                                let steps = ((end - start) * rad).max(8.0) as usize;
-                                let mut prev: Option<(i32, i32)> = None;
-                                for i in 0..=steps {
-                                    let t = start + (end - start) * (i as f64 / steps as f64);
-                                    let px = cx + (t.cos() * rad).round() as i32;
-                                    let py = cy + (t.sin() * rad).round() as i32;
-                                    if let Some((ppx, ppy)) = prev {
-                                        canvas.draw_line_mat(ppx, ppy, px, py, width, &mat);
-                                    }
-                                    prev = Some((px, py));
-                                }
-                            }
-                            "polygon" | "triangle" => {
-                                let pts: Vec<(i32, i32)> = args.iter().filter_map(|v| {
-                                    let t = v.as_tuple()?;
-                                    Some((t.get(0)?.as_number()? as i32, t.get(1)?.as_number()? as i32))
-                                }).collect();
-                                if pts.len() >= 2 {
-                                    for i in 0..pts.len() {
-                                        let (x1, y1) = pts[i];
-                                        let (x2, y2) = pts[(i + 1) % pts.len()];
-                                        canvas.draw_line_mat(x1, y1, x2, y2, width, &mat);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        },
-                        _ => {
-                            let _ = self.eval_error("path 不是路径")?;
-                            unreachable!()
-                        }
-                    }
-                }
-                return Ok(Control::Normal);
-            } else {
-                let _ = self.eval_error("material 必须是材质类型")?;
-                unreachable!()
-            }
-        }
-        // 无 material 分支：保持原有逻辑（draw_line/draw_circle 传 f32 颜色，不透明）
-        let (r, g, b): (f32, f32, f32) = {
-            let color_val = self.eval(fields.get("color").unwrap_or(&Expr::Color(0, 0, 0, 255)), block_env.clone())?;
-            match color_val {
-                Value::Color(r, g, b, _a) => (r as f32, g as f32, b as f32),
-                Value::Tuple(t) => (
-                    clamp_f32(t.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                    clamp_f32(t.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                    clamp_f32(t.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                ),
-                _ => {
-                    let _ = self.eval_error("color 错误")?;
-                    unreachable!()
-                }
-            }
-        };
-        if let Some(canvas) = &mut self.canvas {
-            match path_val {
-                Value::Path(tag, args) => match tag.as_str() {
-                    "line" => {
-                        let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                        let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                        canvas.draw_line(
-                            p1.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                            p1.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                            p2.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                            p2.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32,
-                            width, r, g, b,
-                        );
-                    }
-                    "circle" => {
-                        let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let rad = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        canvas.draw_circle(cx, cy, rad, width, r, g, b);
-                    }
-                    "bezier" => {
-                        let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                        let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                        let p3 = args.get(2).and_then(|v| v.as_tuple()).unwrap_or_default();
-                        let p4 = args.get(3).and_then(|v| v.as_tuple()).unwrap_or_default();
-                        let n = if samples > 0 { samples as usize } else { 64 };
-                        let pts = canvas.sample_bezier3(
-                            (p1.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                             p1.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                            (p2.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                             p2.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                            (p3.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                             p3.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                            (p4.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                             p4.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                            n,
-                        );
-                        for i in 0..pts.len().saturating_sub(1) {
-                            canvas.draw_line(pts[i].0, pts[i].1, pts[i + 1].0, pts[i + 1].1, width, r, g, b);
-                        }
-                    }
-                    "qbezier" => {
-                        let p1 = args.get(0).and_then(|v| v.as_tuple()).unwrap_or_default();
-                        let p2 = args.get(1).and_then(|v| v.as_tuple()).unwrap_or_default();
-                        let p3 = args.get(2).and_then(|v| v.as_tuple()).unwrap_or_default();
-                        let n = if samples > 0 { samples as usize } else { 32 };
-                        let pts = canvas.sample_bezier2(
-                            (p1.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                             p1.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                            (p2.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                             p2.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                            (p3.get(0).and_then(|v| v.as_number()).unwrap_or(0.0),
-                             p3.get(1).and_then(|v| v.as_number()).unwrap_or(0.0)),
-                            n,
-                        );
-                        for i in 0..pts.len().saturating_sub(1) {
-                            canvas.draw_line(pts[i].0, pts[i].1, pts[i + 1].0, pts[i + 1].1, width, r, g, b);
-                        }
-                    }
-                    "polyline" => {
-                        // v0.9: 支持 join 字段（miter/bevel/round）
-                        let pts: Vec<(f64, f64)> = args.iter().filter_map(|v| {
-                            let t = v.as_tuple()?;
-                            Some((
-                                t.get(0).and_then(|x| x.as_number()).unwrap_or(0.0),
-                                t.get(1).and_then(|y| y.as_number()).unwrap_or(0.0),
-                            ))
-                        }).collect();
-                        if pts.len() >= 2 {
-                            draw_polyline_join(canvas, &pts, width, r, g, b, &join);
-                        }
-                    }
-                    // v0.75 新增 Path 类型
-                    "rect" => {
-                        let x = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let w = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let h = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        canvas.draw_rect(x, y, w, h, width, r, g, b);
-                    }
-                    "ellipse" => {
-                        let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let rx = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let ry = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        canvas.draw_ellipse(cx, cy, rx, ry, width, r, g, b);
-                    }
-                    "arc" => {
-                        let cx = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let cy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let rad = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                        let start = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0);
-                        let end = args.get(4).and_then(|v| v.as_number()).unwrap_or(0.0);
-                        canvas.draw_arc(cx, cy, rad, start, end, width, r, g, b);
-                    }
-                    "polygon" | "triangle" => {
-                        // 闭合多边形轮廓
-                        let pts: Vec<(i32, i32)> = args.iter().filter_map(|v| {
-                            let t = v.as_tuple()?;
-                            Some((t.get(0)?.as_number()? as i32, t.get(1)?.as_number()? as i32))
-                        }).collect();
-                        if pts.len() >= 2 {
-                            for i in 0..pts.len() {
-                                let (x1, y1) = pts[i];
-                                let (x2, y2) = pts[(i + 1) % pts.len()];
-                                canvas.draw_line(x1, y1, x2, y2, width, r, g, b);
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                _ => {
-                    let _ = self.eval_error("path 不是路径")?;
-                    unreachable!()
-                }
+    fn exec_block(
+        &mut self,
+        stmts: &[Stmt],
+        env: Rc<RefCell<Env>>,
+    ) -> VglResult<Control> {
+        for s in stmts {
+            match self.exec(s, env.clone())? {
+                Control::Normal => {}
+                other => return Ok(other),
             }
         }
         Ok(Control::Normal)
     }
 
-    pub fn do_import(&mut self, path: &str, env: Rc<RefCell<Env>>) -> ExecResult {
-        let full_path = if path.starts_with('/') || (path.starts_with('.') && path.len() > 1 && path.as_bytes()[1] == b'/') {
+    fn exec_use(&mut self, path: &str, env: Rc<RefCell<Env>>, pos: usize) -> VglResult<()> {
+        let full = if std::path::Path::new(path).is_absolute() {
             path.to_string()
         } else {
-            format!("{}/{}", self.current_dir, path)
+            join_path(&self.current_dir, path)
         };
-        let full_abs = match fs::canonicalize(&full_path) {
-            Ok(p) => p.to_string_lossy().to_string(),
-            Err(_) => full_path.clone(),
-        };
-        if self.imported.contains(&full_abs) {
-            return Ok(Control::Normal);
+        let abs = std::fs::canonicalize(&full)
+            .map_err(|e| VglError::new(format!("无法读取 {}: {}", full, e), pos))?
+            .to_string_lossy()
+            .to_string();
+        if self.imported.contains(&abs) {
+            return Ok(());
         }
-        self.imported.push(full_abs.clone());
-        let src = match fs::read_to_string(&full_path) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = self.eval_error(&format!("无法导入模块 {}: {}", path, e))?;
-                unreachable!()
-            }
+        self.imported.push(abs.clone());
+        let src = std::fs::read_to_string(&abs)
+            .map_err(|e| VglError::new(format!("无法读取 {}: {}", abs, e), pos))?;
+        let ast = {
+            let lexer = crate::lexer::Lexer::new(&src);
+            let toks = lexer.tokenize()?;
+            let mut parser = crate::parser::Parser::new(toks);
+            parser.parse_program()?
         };
-        // 切换文件上下文（错误定位 + 嵌套 import 路径解析）
-        let old_dir = self.current_dir.clone();
-        let old_fn = self.current_filename.clone();
-        let old_src = self.current_src.clone();
-        let old_pos = self.current_pos;
-        self.current_dir = Path::new(&full_path)
+        // 切换文件上下文（嵌套 use 相对当前文件；错误定位正确）
+        let (prev_dir, prev_file, prev_src) = (
+            self.current_dir.clone(),
+            self.current_filename.clone(),
+            self.current_src.clone(),
+        );
+        self.current_dir = std::path::Path::new(&abs)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string());
-        self.current_filename = full_path.clone();
-        self.current_src = src.clone();
-        let result = (|| -> VglResult<()> {
-            let mut lexer = Lexer::new(&src);
-            let tokens = lexer.tokenize()?;
-            let mut parser = Parser::new(tokens);
-            let ast = parser.parse_program()?;
-            for s in ast {
-                self.exec(&s, env.clone()).map_err(|_| {
-                    VglError::new("import 子文件执行失败", Some(0))
-                })?;
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(_) => {
-                // 正常完成，恢复主文件上下文
-                self.current_dir = old_dir;
-                self.current_filename = old_fn;
-                self.current_src = old_src;
-                self.current_pos = old_pos;
-                Ok(Control::Normal)
-            }
-            Err(e) => {
-                // 异常时保留子文件上下文（错误定位用）
-                let full = format_error(&e.msg, &self.current_src, e.pos, &self.current_filename);
-                eprintln!("VGL 错误: {}", full);
-                std::process::exit(1);
+            .unwrap_or_else(|| ".".into());
+        self.current_filename = abs.clone();
+        self.current_src = src;
+        for s in &ast {
+            match self.exec(s, env.clone())? {
+                Control::Normal => {}
+                _ => break,
             }
         }
-    }
-
-    pub fn exec_layer(&mut self, name: &str, body: &[StmtWithPos], env: Rc<RefCell<Env>>) -> ExecResult {
-        if let Some(canvas) = &self.canvas {
-            let layer_canvas = Canvas::new(canvas.width, canvas.height);
-            let old_canvas = std::mem::replace(&mut self.canvas, Some(layer_canvas));
-            let block_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-            let _ = self.execute_block(body, block_env);
-            let new_canvas = self.canvas.take().unwrap();
-            self.layers
-                .insert(name.to_string(), Value::Layer(Rc::new(RefCell::new(new_canvas))));
-            self.canvas = old_canvas;
-        }
-        Ok(Control::Normal)
-    }
-
-    pub fn execute_block(&mut self, body: &[StmtWithPos], env: Rc<RefCell<Env>>) -> ExecResult {
-        for stmt in body {
-            match self.exec(stmt, env.clone())? {
-                Control::Normal => {},
-                c => return Ok(c),
-            }
-        }
-        Ok(Control::Normal)
-    }
-
-    pub fn construct_struct(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        kwargs: &HashMap<String, Expr>,
-        env: Rc<RefCell<Env>>,
-    ) -> VglResult<Value> {
-        let (field_names, default_vals) = self.struct_defs.get(name).cloned().unwrap_or_default();
-        let mut fields = HashMap::new();
-        for (fname, dval) in field_names.iter().zip(default_vals.iter()) {
-            fields.insert(fname.clone(), dval.clone());
-        }
-        for (i, arg_expr) in args.iter().enumerate() {
-            if i < field_names.len() {
-                let val = self.eval(arg_expr, env.clone())?;
-                fields.insert(field_names[i].clone(), val);
-            } else {
-                return Err(VglError::new("参数过多", self.current_pos));
-            }
-        }
-        for (k, v_expr) in kwargs {
-            if fields.contains_key(k) {
-                let val = self.eval(v_expr, env.clone())?;
-                fields.insert(k.clone(), val);
-            } else {
-                return Err(VglError::new(format!("未知字段: {}", k), self.current_pos));
-            }
-        }
-        Ok(Value::Struct(Rc::new(RefCell::new(fields))))
-    }
-
-    /// v0.9: 构造 class 实例
-    pub fn construct_class(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        kwargs: &HashMap<String, Expr>,
-        env: Rc<RefCell<Env>>,
-    ) -> VglResult<Value> {
-        // 收集当前类及父链的所有字段默认值
-        let mut fields = HashMap::new();
-        self.collect_class_fields(name, &mut fields, env.clone())?;
-        // 位置参数覆盖
-        let field_names: Vec<String> = fields.keys().cloned().collect();
-        for (i, arg_expr) in args.iter().enumerate() {
-            if i < field_names.len() {
-                let val = self.eval(arg_expr, env.clone())?;
-                fields.insert(field_names[i].clone(), val);
-            } else {
-                return Err(VglError::new("class 参数过多", self.current_pos));
-            }
-        }
-        // 关键字参数覆盖
-        for (k, v_expr) in kwargs {
-            if fields.contains_key(k) {
-                let val = self.eval(v_expr, env.clone())?;
-                fields.insert(k.clone(), val);
-            } else {
-                return Err(VglError::new(format!("未知字段: {}", k), self.current_pos));
-            }
-        }
-        let instance = Value::Instance(Rc::new(RefCell::new(crate::ast::InstanceData {
-            fields,
-            class_name: name.to_string(),
-        })));
-        // 若存在 init 方法则调用
-        if let Some((params, body)) = self.lookup_method(name, "init")? {
-            self.invoke_method(&params, &body, args, kwargs, &instance, env.clone())?;
-        }
-        Ok(instance)
-    }
-
-    /// v0.9: 递归收集 class 及父类的字段（父类先，子类覆盖）
-    fn collect_class_fields(
-        &mut self,
-        name: &str,
-        fields: &mut HashMap<String, Value>,
-        env: Rc<RefCell<Env>>,
-    ) -> VglResult<()> {
-        // 先克隆类数据，避免借用冲突
-        let (parent, field_list) = if let Some(class) = self.class_defs.get(name) {
-            (class.parent.clone(), class.fields.clone())
-        } else {
-            return Ok(());
-        };
-        // 先收集父类字段
-        if let Some(ref parent) = parent {
-            self.collect_class_fields(parent, fields, env.clone())?;
-        }
-        // 再收集本类字段默认值
-        for (fname, default_expr) in &field_list {
-            let val = self.eval(default_expr, env.clone())?;
-            fields.insert(fname.clone(), val);
-        }
+        self.current_dir = prev_dir;
+        self.current_filename = prev_file;
+        self.current_src = prev_src;
         Ok(())
     }
 
-    /// v0.9: 在类继承链中查找方法，返回 (params, body)
-    pub fn lookup_method(
-        &self,
-        class_name: &str,
-        method: &str,
-    ) -> VglResult<Option<(Vec<(String, Option<Expr>)>, Vec<StmtWithPos>)>> {
-        let mut current = Some(class_name.to_string());
-        while let Some(cn) = current {
-            if let Some(class) = self.class_defs.get(&cn) {
-                if let Some((params, body)) = class.methods.get(method) {
-                    return Ok(Some((params.clone(), body.clone())));
-                }
-                current = class.parent.clone();
-            } else {
-                break;
-            }
+    fn render_to(&mut self, fname: &str, pos: usize) -> VglResult<()> {
+        let full = join_path(&self.base_dir, fname);
+        if self.scene.width <= 0.0 || self.scene.height <= 0.0 {
+            return Err(VglError::new(
+                "render 前需要先声明 canvas 尺寸（如 canvas 800x600）",
+                pos,
+            ));
         }
-        Ok(None)
+        if !self.scene.open.is_empty() {
+            return Err(VglError::new("存在未闭合的 group", pos));
+        }
+        let svg = write_svg(&self.scene);
+        std::fs::write(&full, svg)
+            .map_err(|e| VglError::new(format!("无法写入 {}: {}", full, e), pos))?;
+        let n = self.scene.root.len();
+        eprintln!("已渲染: {} ({}x{}, {} 个元素)", full, fmt_num(self.scene.width), fmt_num(self.scene.height), n);
+        self.rendered.push(full);
+        self.scene.root.clear();
+        self.scene.defs.clear();
+        self.def_map.clear();
+        self.next_def = 0;
+        Ok(())
     }
 
-    /// v0.9: 调用方法 — 绑定 self 并执行方法体
-    /// v1.0: 支持默认参数 + kwargs 校验
-    pub fn invoke_method(
+    // ==================== 表达式求值 ====================
+
+    pub fn eval(&mut self, expr: &Expr, env: Rc<RefCell<Env>>) -> VglResult<Value> {
+        match expr {
+            Expr::Num(v, _) => Ok(Value::Num(*v)),
+            Expr::Str(s, _) => Ok(Value::Str(s.clone())),
+            Expr::Bool(b, _) => Ok(Value::Bool(*b)),
+            Expr::NoneLit(_) => Ok(Value::None),
+            Expr::Ident(name, pos) => Env::lookup(&env, name).ok_or_else(|| {
+                VglError::new(format!("未定义的变量 '{}'", name), *pos)
+            }),
+            Expr::ArrLit(items, _) => {
+                let mut v = Vec::new();
+                for i in items {
+                    v.push(self.eval(i, env.clone())?);
+                }
+                Ok(Value::Arr(Rc::new(RefCell::new(v))))
+            }
+            Expr::Unary { op, expr, pos } => {
+                let v = self.eval(expr, env)?;
+                match (*op, v) {
+                    ("-", Value::Num(n)) => Ok(Value::Num(-n)),
+                    ("!", Value::Bool(b)) => Ok(Value::Bool(!b)),
+                    (op, v) => Err(VglError::new(
+                        format!("一元 '{}' 不能用于 {}", op, v.type_name()),
+                        *pos,
+                    )),
+                }
+            }
+            Expr::Binary { op, lhs, rhs, pos } => self.eval_binary(op, lhs, rhs, env, *pos),
+            Expr::Index { obj, idx, pos } => {
+                let o = self.eval(obj, env.clone())?;
+                let i = self.eval(idx, env)?;
+                match (&o, i) {
+                    (Value::Arr(a), Value::Num(n)) => {
+                        let len = a.borrow().len();
+                        let idx = n as usize;
+                        if n < 0.0 || idx >= len {
+                            Err(VglError::new(
+                                format!("数组索引 {} 越界（长度 {}）", fmt_num(n), len),
+                                *pos,
+                            ))
+                        } else {
+                            Ok(a.borrow()[idx].clone())
+                        }
+                    }
+                    (Value::Str(s), Value::Num(n)) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        let idx = n as usize;
+                        if n < 0.0 || idx >= chars.len() {
+                            Err(VglError::new(
+                                format!("字符串索引 {} 越界（长度 {}）", fmt_num(n), chars.len()),
+                                *pos,
+                            ))
+                        } else {
+                            Ok(Value::Str(chars[idx].to_string()))
+                        }
+                    }
+                    (o, i) => Err(VglError::new(
+                        format!("不能用 {} 索引 {}", i.type_name(), o.type_name()),
+                        *pos,
+                    )),
+                }
+            }
+            Expr::Call { name, args, named, pos } => {
+                // 用户函数优先（可覆盖内建）
+                if let Some(Value::Fn(f)) = env_visibility(&env, name) {
+                    let mut argv = Vec::new();
+                    for a in args {
+                        argv.push(self.eval(a, env.clone())?);
+                    }
+                    let mut named_v = Vec::new();
+                    for (n, e, p) in named {
+                        named_v.push((n.clone(), self.eval(e, env.clone())?, *p));
+                    }
+                    return self.call_user(f, argv, named_v, *pos);
+                }
+                let mut argv = Vec::new();
+                for a in args {
+                    argv.push(self.eval(a, env.clone())?);
+                }
+                let mut named_v = Vec::new();
+                for (n, e, p) in named {
+                    named_v.push((n.clone(), self.eval(e, env.clone())?, *p));
+                }
+                self.call_builtin(name, argv, named_v, *pos)
+            }
+        }
+    }
+
+    fn eval_binary(
         &mut self,
-        params: &[(String, Option<Expr>)],
-        body: &[StmtWithPos],
-        args: &[Expr],
-        kwargs: &HashMap<String, Expr>,
-        self_val: &Value,
+        op: &str,
+        lhs: &Expr,
+        rhs: &Expr,
         env: Rc<RefCell<Env>>,
+        pos: usize,
     ) -> VglResult<Value> {
-        let method_env = Rc::new(RefCell::new(Env::new(Some(env.clone()))));
-        // 绑定 self
-        method_env.borrow_mut().vars.insert("self".to_string(), self_val.clone());
-        // v1.0: 1. 先应用默认值
-        for (pname, default) in params.iter() {
-            if pname == "self" {
-                continue;
+        // 短路逻辑
+        if op == "and" || op == "or" {
+            let lv = self.eval(lhs, env.clone())?;
+            let l = self.truthy(lv, lhs.pos())?;
+            let short = if op == "and" { !l } else { l };
+            if short {
+                return Ok(Value::Bool(short == (op == "or")));
             }
-            if let Some(def_expr) = default {
-                let dv = self.eval(def_expr, env.clone())?;
-                method_env.borrow_mut().vars.insert(pname.clone(), dv);
+            let rv = self.eval(rhs, env)?;
+            let r = self.truthy(rv, rhs.pos())?;
+            return Ok(Value::Bool(r));
+        }
+        let l = self.eval(lhs, env.clone())?;
+        let r = self.eval(rhs, env)?;
+        match (op, &l, &r) {
+            ("+", Value::Num(a), Value::Num(b)) => Ok(Value::Num(a + b)),
+            ("+", Value::Str(a), _) => Ok(Value::Str(format!("{}{}", a, display(&r)))),
+            ("+", _, Value::Str(b)) => Ok(Value::Str(format!("{}{}", display(&l), b))),
+            ("-", Value::Num(a), Value::Num(b)) => Ok(Value::Num(a - b)),
+            ("*", Value::Num(a), Value::Num(b)) => Ok(Value::Num(a * b)),
+            ("/", Value::Num(a), Value::Num(b)) => {
+                if *b == 0.0 {
+                    Err(VglError::new("除以零", pos))
+                } else {
+                    Ok(Value::Num(a / b))
+                }
+            }
+            ("%", Value::Num(a), Value::Num(b)) => {
+                if *b == 0.0 {
+                    Err(VglError::new("对零取模", pos))
+                } else {
+                    Ok(Value::Num(a % b))
+                }
+            }
+            ("==" , _, _) => Ok(Value::Bool(values_eq(&l, &r))),
+            ("!=" , _, _) => Ok(Value::Bool(!values_eq(&l, &r))),
+            ("<" | "<=" | ">" | ">=", Value::Num(a), Value::Num(b)) => Ok(Value::Bool(match op {
+                "<" => a < b,
+                "<=" => a <= b,
+                ">" => a > b,
+                _ => a >= b,
+            })),
+            ("<" | "<=" | ">" | ">=", Value::Str(a), Value::Str(b)) => Ok(Value::Bool(match op {
+                "<" => a < b,
+                "<=" => a <= b,
+                ">" => a > b,
+                _ => a >= b,
+            })),
+            (op, l, r) => Err(VglError::new(
+                format!("不支持 {} {} {}", l.type_name(), op, r.type_name()),
+                pos,
+            )),
+        }
+    }
+
+    fn truthy(&self, v: Value, pos: usize) -> VglResult<bool> {
+        match v {
+            Value::Bool(b) => Ok(b),
+            other => Err(VglError::new(
+                format!("条件需要 bool，得到 {}", other.type_name()),
+                pos,
+            )),
+        }
+    }
+
+    fn num(&self, v: Value, pos: usize, what: &str) -> VglResult<f64> {
+        match v {
+            Value::Num(n) => Ok(n),
+            other => Err(VglError::new(
+                format!("{} 需要数字，得到 {}", what, other.type_name()),
+                pos,
+            )),
+        }
+    }
+
+    // ==================== 用户函数调用 ====================
+
+    fn call_user(
+        &mut self,
+        f: Rc<FnDef>,
+        args: Vec<Value>,
+        named: Vec<(String, Value, usize)>,
+        pos: usize,
+    ) -> VglResult<Value> {
+        if self.depth >= MAX_DEPTH {
+            return Err(VglError::new(
+                format!("调用深度超限（{} 层），检查无限递归", MAX_DEPTH),
+                pos,
+            ));
+        }
+        let env = Rc::new(RefCell::new(Env::new(Some(f.env.clone()))));
+        let n_params = f.params.len();
+        if args.len() > n_params {
+            return Err(VglError::new(
+                format!("函数 {} 最多接受 {} 个参数，得到 {}", f.name, n_params, args.len()),
+                pos,
+            ));
+        }
+        let mut filled: Vec<Option<Value>> = vec![None; n_params];
+        for (i, a) in args.into_iter().enumerate() {
+            filled[i] = Some(a);
+        }
+        for (name, v, npos) in named {
+            let idx = f.params.iter().position(|(p, _)| *p == name);
+            match idx {
+                Some(i) => {
+                    if filled[i].is_some() {
+                        return Err(VglError::new(
+                            format!("参数 '{}' 同时以位置和命名传入", name),
+                            npos,
+                        ));
+                    }
+                    filled[i] = Some(v);
+                }
+                None => {
+                    return Err(VglError::new(
+                        format!("函数 {} 没有参数 '{}'", f.name, name),
+                        npos,
+                    ))
+                }
             }
         }
-        // 2. 绑定位置参数（跳过 self）
-        let mut arg_idx = 0;
-        for (pname, _) in params.iter() {
-            if pname == "self" {
-                continue;
-            }
-            if arg_idx < args.len() {
-                let val = self.eval(&args[arg_idx], env.clone())?;
-                method_env.borrow_mut().vars.insert(pname.clone(), val);
-                arg_idx += 1;
+        for (i, (pname, default)) in f.params.iter().enumerate() {
+            if filled[i].is_none() {
+                match default {
+                    Some(d) => filled[i] = Some(self.eval(d, env.clone())?),
+                    None => {
+                        return Err(VglError::new(
+                            format!("函数 {} 缺少参数 '{}'", f.name, pname),
+                            pos,
+                        ))
+                    }
+                }
             }
         }
-        // 3. 绑定命名参数 + 校验
-        let param_names: std::collections::HashSet<&str> =
-            params.iter().map(|(n, _)| n.as_str()).collect();
-        for (k, v_expr) in kwargs {
-            if !param_names.contains(k.as_str()) {
-                return Err(VglError::new(
-                    format!("方法没有参数 '{}'", k),
-                    self.current_pos,
-                ));
-            }
-            let val = self.eval(v_expr, env.clone())?;
-            method_env.borrow_mut().vars.insert(k.clone(), val);
+        for ((pname, _), v) in f.params.iter().zip(filled.into_iter()) {
+            Env::define(&env, pname, v.unwrap());
         }
-        match self.execute_block(body, method_env)? {
+        self.depth += 1;
+        let result = self.exec_block(&f.body, env);
+        self.depth -= 1;
+        match result? {
             Control::Return(v) => Ok(v),
             _ => Ok(Value::None),
         }
     }
 
-    /// v0.8 变换 & 裁剪
-    pub fn apply_transform(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
-        let n = |idx: usize| -> f64 {
-            args.get(idx).and_then(|v| v.as_number()).unwrap_or(0.0)
-        };
-        match name {
-            "translate" => {
-                // translate(tx, ty)：在当前变换上叠加平移
-                let t = Transform::translate(n(0), n(1));
-                let cur = self.transform_stack.last().cloned().unwrap_or_else(Transform::identity);
-                *self.transform_stack.last_mut().unwrap() = cur.compose(&t);
-            }
-            "rotate" => {
-                // rotate(rad)：在当前变换上叠加旋转（弧度）
-                let t = Transform::rotate(n(0));
-                let cur = self.transform_stack.last().cloned().unwrap_or_else(Transform::identity);
-                *self.transform_stack.last_mut().unwrap() = cur.compose(&t);
-            }
-            "scale" => {
-                // scale(sx, sy)：在当前变换上叠加缩放
-                let sx = n(0);
-                let sy = if args.len() > 1 { n(1) } else { sx };
-                let t = Transform::scale(sx, sy);
-                let cur = self.transform_stack.last().cloned().unwrap_or_else(Transform::identity);
-                *self.transform_stack.last_mut().unwrap() = cur.compose(&t);
-            }
-            "push_transform" => {
-                // push_transform()：压入当前变换的副本
-                let cur = self.transform_stack.last().cloned().unwrap_or_else(Transform::identity);
-                self.transform_stack.push(cur);
-            }
-            "pop_transform" => {
-                // pop_transform()：弹出变换栈（保留至少一个）
-                if self.transform_stack.len() > 1 {
-                    self.transform_stack.pop();
-                } else {
-                    return Err(VglError::new("pop_transform 栈下溢", self.current_pos));
+    // ==================== group 构建 ====================
+
+    fn build_group(
+        &mut self,
+        named: &mut Vec<(String, Value, usize)>,
+        pos: usize,
+    ) -> VglResult<Element> {
+        let mut g = Element::new("g");
+        let mut transform = String::new();
+        for key in ["translate", "rotate", "scale"] {
+            if let Some(v) = take_named(named, key) {
+                match key {
+                    "translate" | "scale" => {
+                        let nums = self.flat_nums(&v.0, pos, key)?;
+                        let s = match nums.as_slice() {
+                            [a, b] => format!("{}({},{})", key, fmt_num(*a), fmt_num(*b)),
+                            [a] => format!("{}({})", key, fmt_num(*a)),
+                            _ => {
+                                return Err(VglError::new(
+                                    format!("{} 需要 [x, y] 数组", key),
+                                    pos,
+                                ))
+                            }
+                        };
+                        transform.push_str(&s);
+                        transform.push(' ');
+                    }
+                    _ => {
+                        let d = self.num(v.0, pos, "rotate")?;
+                        transform.push_str(&format!("rotate({}) ", fmt_num(d)));
+                    }
                 }
             }
-            "clip_rect" => {
-                // clip_rect(x, y, w, h)：压入裁剪矩形（与栈顶求交集）
-                let x = n(0) as i32;
-                let y = n(1) as i32;
-                let w = n(2) as i32;
-                let h = n(3) as i32;
-                let new_clip = ClipRect { x, y, w, h };
-                if let Some(parent) = self.clip_stack.last() {
-                    // 求交集
-                    let ix = x.max(parent.x);
-                    let iy = y.max(parent.y);
-                    let ix2 = (x + w).min(parent.x + parent.w);
-                    let iy2 = (y + h).min(parent.y + parent.h);
-                    self.clip_stack.push(ClipRect {
-                        x: ix,
-                        y: iy,
-                        w: (ix2 - ix).max(0),
-                        h: (iy2 - iy).max(0),
-                    });
+        }
+        if !transform.is_empty() {
+            g.set("transform", transform.trim_end());
+        }
+        if let Some((v, p)) = take_named(named, "opacity") {
+            let o = self.num(v, p, "opacity")?;
+            g.set("opacity", fmt_num(o));
+        }
+        if let Some((v, p)) = take_named(named, "blur") {
+            let b = self.num(v, p, "blur")?;
+            if b > 0.0 {
+                let id = self.blur_id(b);
+                g.set("filter", format!("url(#{})", id));
+            }
+        }
+        reject_unknown(named, "group", &["translate", "rotate", "scale", "opacity", "blur"], pos)?;
+        Ok(g)
+    }
+
+    // ==================== defs 注册 ====================
+
+    fn grad_id(&mut self, spec: &GradSpec) -> String {
+        let key = format!("{:?}", spec);
+        if let Some(id) = self.def_map.get(&key) {
+            return id.clone();
+        }
+        let id = format!("g{}", self.next_def);
+        self.next_def += 1;
+        let mut stops = String::new();
+        for (c, off) in &spec.stops {
+            stops.push_str(&format!(
+                "<stop offset=\"{}\" stop-color=\"{}\"{}/>",
+                fmt_num(*off * 100.0),
+                c.hex(),
+                if c.a < 1.0 { format!(" stop-opacity=\"{}\"", fmt_num(c.a)) } else { String::new() }
+            ));
+        }
+        let xml = match spec.kind {
+            GradKind::Linear => {
+                let c = &spec.coords;
+                format!(
+                    "<linearGradient id=\"{}\" gradientUnits=\"userSpaceOnUse\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\">{}</linearGradient>",
+                    id, fmt_num(c[0]), fmt_num(c[1]), fmt_num(c[2]), fmt_num(c[3]), stops
+                )
+            }
+            GradKind::Radial => {
+                let c = &spec.coords;
+                format!(
+                    "<radialGradient id=\"{}\" gradientUnits=\"userSpaceOnUse\" cx=\"{}\" cy=\"{}\" r=\"{}\">{}</radialGradient>",
+                    id, fmt_num(c[0]), fmt_num(c[1]), fmt_num(c[2]), stops
+                )
+            }
+        };
+        self.scene.defs.push(xml);
+        self.def_map.insert(key, id.clone());
+        id
+    }
+
+    fn blur_id(&mut self, radius: f64) -> String {
+        let key = format!("blur:{}", radius);
+        if let Some(id) = self.def_map.get(&key) {
+            return id.clone();
+        }
+        let id = format!("b{}", self.next_def);
+        self.next_def += 1;
+        self.scene.defs.push(format!(
+            "<filter id=\"{}\" x=\"-50%\" y=\"-50%\" width=\"200%\" height=\"200%\"><feGaussianBlur stdDeviation=\"{}\"/></filter>",
+            id,
+            fmt_num(radius)
+        ));
+        self.def_map.insert(key, id.clone());
+        id
+    }
+
+    // ==================== 绘图参数处理 ====================
+
+    /// 颜色/渐变值 → SVG 属性值；返回 (attr, 额外透明度)
+    fn paint(&mut self, v: &Value, what: &str, pos: usize) -> VglResult<(String, Option<f64>)> {
+        match v {
+            Value::None => Ok(("none".to_string(), None)),
+            Value::Color(c) => Ok((c.hex(), if c.a < 1.0 { Some(c.a) } else { None })),
+            Value::Grad(g) => {
+                let id = self.grad_id(g);
+                Ok((format!("url(#{})", id), None))
+            }
+            Value::Str(s) => {
+                // 允许 CSS 颜色名 / #hex / rgb() 字符串
+                if s.starts_with('#') && parse_hex_color(s).is_none() {
+                    return Err(VglError::new(format!("{} 非法颜色 '{}'", what, s), pos));
+                }
+                Ok((s.clone(), None))
+            }
+            other => Err(VglError::new(
+                format!("{} 需要颜色/渐变/none，得到 {}", what, other.type_name()),
+                pos,
+            )),
+        }
+    }
+
+    fn flat_nums(&self, v: &Value, pos: usize, what: &str) -> VglResult<Vec<f64>> {
+        match v {
+            Value::Num(n) => Ok(vec![*n]),
+            Value::Arr(a) => {
+                let mut out = Vec::new();
+                for item in a.borrow().iter() {
+                    match item {
+                        Value::Num(n) => out.push(*n),
+                        Value::Arr(_) => out.extend(self.flat_nums(item, pos, what)?),
+                        other => {
+                            return Err(VglError::new(
+                                format!("{} 数组内应为数字，得到 {}", what, other.type_name()),
+                                pos,
+                            ))
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            other => Err(VglError::new(
+                format!("{} 需要数字数组，得到 {}", what, other.type_name()),
+                pos,
+            )),
+        }
+    }
+
+    /// 提取形状通用命名参数（fill/stroke/stroke_width/opacity/blur/cap/join），
+    /// 返回 (fill属性, fill透明度, stroke属性, stroke透明度, stroke_width, opacity, blur, cap, join)
+    #[allow(clippy::type_complexity)]
+    fn shape_common(
+        &mut self,
+        named: &mut Vec<(String, Value, usize)>,
+        default_fill: bool,
+        pos: usize,
+    ) -> VglResult<(String, Option<f64>, String, Option<f64>, f64, f64, f64, String, String)> {
+        let fill_v = take_named(named, "fill").map(|(v, _)| v);
+        let stroke_v = take_named(named, "stroke").map(|(v, _)| v);
+        // stroke_width 的别名: width（对 line/polyline 更自然）
+        let stroke_w = match take_named(named, "stroke_width") {
+            Some((v, p)) => self.num(v, p, "stroke_width")?,
+            None => match take_named(named, "width") {
+                Some((v, p)) => self.num(v, p, "width")?,
+                None => 1.0,
+            },
+        };
+        let opacity = match take_named(named, "opacity") {
+            Some((v, p)) => self.num(v, p, "opacity")?,
+            None => 1.0,
+        };
+        let blur = match take_named(named, "blur") {
+            Some((v, p)) => self.num(v, p, "blur")?,
+            None => 0.0,
+        };
+        let cap = match take_named(named, "cap") {
+            Some((Value::Str(s), _)) => s,
+            Some((v, p)) => return Err(VglError::new(format!("cap 需要字符串，得到 {}", v.type_name()), p)),
+            None => "butt".to_string(),
+        };
+        let join = match take_named(named, "join") {
+            Some((Value::Str(s), _)) => s,
+            Some((v, p)) => return Err(VglError::new(format!("join 需要字符串，得到 {}", v.type_name()), p)),
+            None => "miter".to_string(),
+        };
+        // fill 规则: 显式传 fill 用之；否则若传了 stroke 就不填充，封闭形状默认黑填充
+        let (fill, fill_op) = match fill_v {
+            Some(v) => self.paint(&v, "fill", pos)?,
+            None => {
+                if stroke_v.is_some() || !default_fill {
+                    ("none".to_string(), None)
                 } else {
-                    self.clip_stack.push(new_clip);
+                    ("#000000".to_string(), None)
                 }
             }
-            "clip_clear" => {
-                // clip_clear()：清空裁剪栈
-                self.clip_stack.clear();
+        };
+        let (stroke, stroke_op) = match stroke_v {
+            Some(v) => self.paint(&v, "stroke", pos)?,
+            None => ("none".to_string(), None),
+        };
+        reject_unknown(
+            named,
+            "形状",
+            &["fill", "stroke", "stroke_width", "width", "opacity", "blur", "cap", "join"],
+            pos,
+        )?;
+        Ok((fill, fill_op, stroke, stroke_op, stroke_w, opacity, blur, cap, join))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_shape(
+        &mut self,
+        mut el: Element,
+        fill: String,
+        fill_op: Option<f64>,
+        stroke: String,
+        stroke_op: Option<f64>,
+        stroke_w: f64,
+        opacity: f64,
+        blur: f64,
+        cap: String,
+        join: String,
+    ) -> Element {
+        if fill != "none" {
+            el.set("fill", fill);
+            if let Some(o) = fill_op {
+                el.set("fill-opacity", fmt_num(o));
             }
-            _ => return Err(VglError::new(format!("未知变换: {}", name), self.current_pos)),
+        } else if stroke != "none" {
+            el.set("fill", "none");
         }
-        Ok(())
-    }
-
-    /// v0.8 获取当前变换
-    pub fn current_transform(&self) -> &Transform {
-        self.transform_stack.last().unwrap_or(&Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 })
-    }
-
-    /// v0.8 检查像素是否在裁剪区域内
-    pub fn is_clipped(&self, x: i32, y: i32) -> bool {
-        if let Some(clip) = self.clip_stack.last() {
-            x < clip.x || y < clip.y || x >= clip.x + clip.w || y >= clip.y + clip.h
-        } else {
-            false
-        }
-    }
-
-    /// v0.75 填充函数：fill_rect / fill_circle / fill_ellipse / fill_polygon / flood_fill
-    pub fn apply_fill(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
-        let canvas = match &mut self.canvas {
-            Some(c) => c,
-            None => return Err(VglError::new("填充需要先声明 canvas", self.current_pos)),
-        };
-        // 提取颜色参数（最后一个参数，支持 (r,g,b) 元组或 #color）
-        let extract_color = |idx: usize| -> (f32, f32, f32) {
-            match args.get(idx) {
-                Some(Value::Tuple(t)) if t.len() >= 3 => (
-                    t[0].as_number().unwrap_or(0.0) as f32,
-                    t[1].as_number().unwrap_or(0.0) as f32,
-                    t[2].as_number().unwrap_or(0.0) as f32,
-                ),
-                Some(Value::Color(r, g, b, _a)) => (*r as f32, *g as f32, *b as f32),
-                _ => (0.0, 0.0, 0.0),
+        if stroke != "none" {
+            el.set("stroke", stroke);
+            el.set("stroke-width", fmt_num(stroke_w));
+            if let Some(o) = stroke_op {
+                el.set("stroke-opacity", fmt_num(o));
             }
-        };
-        // 提取整数参数
-        let n = |idx: usize| -> i32 {
-            args.get(idx).and_then(|v| v.as_number()).unwrap_or(0.0) as i32
-        };
+            if cap != "butt" {
+                el.set("stroke-linecap", cap);
+            }
+            if join != "miter" {
+                el.set("stroke-linejoin", join);
+            }
+        }
+        if opacity < 1.0 {
+            el.set("opacity", fmt_num(opacity));
+        }
+        if blur > 0.0 {
+            let id = self.blur_id(blur);
+            el.set("filter", format!("url(#{})", id));
+        }
+        el
+    }
+
+    // ==================== 内建函数 ====================
+
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        mut args: Vec<Value>,
+        mut named: Vec<(String, Value, usize)>,
+        pos: usize,
+    ) -> VglResult<Value> {
         match name {
-            "fill_rect" => {
-                let (r, g, b) = extract_color(4);
-                canvas.fill_rect(n(0), n(1), n(2), n(3), r, g, b);
+            // ---------- 绘制 ----------
+            "background" => {
+                self.arity(&args, 1, name, pos)?;
+                let (fill, fo) = self.paint(&args.remove(0), "fill", pos)?;
+                let el = Element::new("rect")
+                    .attr("x", "0")
+                    .attr("y", "0")
+                    .attr("width", fmt_num(self.scene.width))
+                    .attr("height", fmt_num(self.scene.height));
+                let el = self.finish_shape(el, fill, fo, "none".into(), None, 0.0, 1.0, 0.0, String::new(), String::new());
+                self.scene.emit(el);
+                Ok(Value::None)
             }
-            "fill_circle" => {
-                let (r, g, b) = extract_color(3);
-                canvas.fill_circle(n(0), n(1), n(2), r, g, b);
-            }
-            "fill_ellipse" => {
-                let (r, g, b) = extract_color(4);
-                canvas.fill_ellipse(n(0), n(1), n(2), n(3), r, g, b);
-            }
-            "fill_polygon" => {
-                let (r, g, b) = extract_color(1);
-                // 第一个参数是点数组
-                let pts: Vec<(i32, i32)> = match args.get(0) {
-                    Some(Value::Array(arr)) => arr.borrow().iter().filter_map(|v| {
-                        let t = v.as_tuple()?;
-                        Some((t.get(0)?.as_number()? as i32, t.get(1)?.as_number()? as i32))
-                    }).collect(),
-                    Some(Value::Tuple(t)) => t.iter().filter_map(|v| {
-                        let pt = v.as_tuple()?;
-                        Some((pt.get(0)?.as_number()? as i32, pt.get(1)?.as_number()? as i32))
-                    }).collect(),
-                    _ => vec![],
+            "rect" => {
+                self.arity_range(&args, 4, 4, name, pos)?;
+                let x = self.num(args[0].clone(), pos, "x")?;
+                let y = self.num(args[1].clone(), pos, "y")?;
+                let w = self.num(args[2].clone(), pos, "width")?;
+                let h = self.num(args[3].clone(), pos, "height")?;
+                let rx = match take_named(&mut named, "rx") {
+                    Some((v, p)) => self.num(v, p, "rx")?,
+                    None => 0.0,
                 };
-                canvas.fill_polygon(&pts, r, g, b);
+                reject_unknown(&mut named, "rect", &["rx", "fill", "stroke", "stroke_width", "width", "opacity", "blur", "cap", "join"], pos)?;
+                let (f, fo, s, so, sw, o, b, cap, join) = self.shape_common_named(&mut named, true, pos)?;
+                let el = Element::new("rect")
+                    .attr("x", fmt_num(x))
+                    .attr("y", fmt_num(y))
+                    .attr("width", fmt_num(w))
+                    .attr("height", fmt_num(h));
+                let el = if rx > 0.0 { el.attr("rx", fmt_num(rx)) } else { el };
+                let el = self.finish_shape(el, f, fo, s, so, sw, o, b, cap, join);
+                self.scene.emit(el);
+                Ok(Value::None)
             }
-            "flood_fill" => {
-                let (r, g, b) = extract_color(2);
-                canvas.flood_fill(n(0), n(1), r, g, b);
+            "circle" => {
+                self.arity_range(&args, 3, 3, name, pos)?;
+                let cx = self.num(args[0].clone(), pos, "cx")?;
+                let cy = self.num(args[1].clone(), pos, "cy")?;
+                let r = self.num(args[2].clone(), pos, "r")?;
+                let (f, fo, s, so, sw, o, b, cap, join) = self.shape_common_named(&mut named, true, pos)?;
+                let el = Element::new("circle")
+                    .attr("cx", fmt_num(cx))
+                    .attr("cy", fmt_num(cy))
+                    .attr("r", fmt_num(r));
+                let el = self.finish_shape(el, f, fo, s, so, sw, o, b, cap, join);
+                self.scene.emit(el);
+                Ok(Value::None)
             }
-            _ => return Err(VglError::new(format!("未知填充: {}", name), self.current_pos)),
-        }
-        Ok(())
-    }
+            "ellipse" => {
+                self.arity_range(&args, 4, 4, name, pos)?;
+                let cx = self.num(args[0].clone(), pos, "cx")?;
+                let cy = self.num(args[1].clone(), pos, "cy")?;
+                let rx = self.num(args[2].clone(), pos, "rx")?;
+                let ry = self.num(args[3].clone(), pos, "ry")?;
+                let (f, fo, s, so, sw, o, b, cap, join) = self.shape_common_named(&mut named, true, pos)?;
+                let el = Element::new("ellipse")
+                    .attr("cx", fmt_num(cx))
+                    .attr("cy", fmt_num(cy))
+                    .attr("rx", fmt_num(rx))
+                    .attr("ry", fmt_num(ry));
+                let el = self.finish_shape(el, f, fo, s, so, sw, o, b, cap, join);
+                self.scene.emit(el);
+                Ok(Value::None)
+            }
+            "line" => {
+                self.arity_range(&args, 4, 4, name, pos)?;
+                let x1 = self.num(args[0].clone(), pos, "x1")?;
+                let y1 = self.num(args[1].clone(), pos, "y1")?;
+                let x2 = self.num(args[2].clone(), pos, "x2")?;
+                let y2 = self.num(args[3].clone(), pos, "y2")?;
+                let (f, fo, mut s, so, sw, o, b, cap, join) = self.shape_common_named(&mut named, false, pos)?;
+                if s == "none" && f == "none" {
+                    s = "#000000".to_string(); // line 默认可见
+                }
+                let el = Element::new("line")
+                    .attr("x1", fmt_num(x1))
+                    .attr("y1", fmt_num(y1))
+                    .attr("x2", fmt_num(x2))
+                    .attr("y2", fmt_num(y2));
+                let el = self.finish_shape(el, f, fo, s, so, sw, o, b, cap, join);
+                self.scene.emit(el);
+                Ok(Value::None)
+            }
+            "polygon" | "polyline" => {
+                self.arity_range(&args, 1, 1, name, pos)?;
+                let pts = self.flat_nums(&args[0], pos, "points")?;
+                if pts.len() < 4 || pts.len() % 2 != 0 {
+                    return Err(VglError::new(
+                        format!("points 需要偶数个坐标（至少 2 个点），得到 {} 个", pts.len()),
+                        pos,
+                    ));
+                }
+                let s: String = pts
+                    .chunks(2)
+                    .map(|c| format!("{},{}", fmt_num(c[0]), fmt_num(c[1])))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let (f, fo, st, so, sw, o, b, cap, join) =
+                    self.shape_common_named(&mut named, name == "polygon", pos)?;
+                let el = Element::new(if name == "polygon" { "polygon" } else { "polyline" })
+                    .attr("points", s);
+                let el = self.finish_shape(el, f, fo, st, so, sw, o, b, cap, join);
+                self.scene.emit(el);
+                Ok(Value::None)
+            }
+            "path" => {
+                self.arity_range(&args, 1, 1, name, pos)?;
+                let d = match args.remove(0) {
+                    Value::Str(s) => s,
+                    other => {
+                        return Err(VglError::new(
+                            format!("path 需要 SVG path 数据字符串，得到 {}", other.type_name()),
+                            pos,
+                        ))
+                    }
+                };
+                let (f, fo, st, so, sw, o, b, cap, join) = self.shape_common_named(&mut named, false, pos)?;
+                let el = Element::new("path").attr("d", d);
+                let el = self.finish_shape(el, f, fo, st, so, sw, o, b, cap, join);
+                self.scene.emit(el);
+                Ok(Value::None)
+            }
+            "text" => {
+                self.arity_range(&args, 3, 3, name, pos)?;
+                let x = self.num(args[0].clone(), pos, "x")?;
+                let y = self.num(args[1].clone(), pos, "y")?;
+                let content = match args[2].clone() {
+                    Value::Str(s) => s,
+                    other => display(&other),
+                };
+                let size = match take_named(&mut named, "size") {
+                    Some((v, p)) => self.num(v, p, "size")?,
+                    None => 16.0,
+                };
+                let font = take_named(&mut named, "font").map(|(v, _)| match v {
+                    Value::Str(s) => s,
+                    _ => "sans-serif".to_string(),
+                }).unwrap_or_else(|| "sans-serif".to_string());
+                let weight = take_named(&mut named, "weight").map(|(v, _)| match v {
+                    Value::Str(s) => s,
+                    _ => "normal".to_string(),
+                }).unwrap_or_else(|| "normal".to_string());
+                let anchor = take_named(&mut named, "anchor").map(|(v, _)| match v {
+                    Value::Str(s) => s,
+                    _ => "start".to_string(),
+                }).unwrap_or_else(|| "start".to_string());
+                reject_unknown(&mut named, "text", &["size", "font", "weight", "anchor", "fill", "stroke", "stroke_width", "width", "opacity", "blur", "cap", "join"], pos)?;
+                let (f, fo, st, so, sw, o, b, _cap, _join) = self.shape_common_named(&mut named, true, pos)?;
+                let mut el = Element::new("text")
+                    .attr("x", fmt_num(x))
+                    .attr("y", fmt_num(y))
+                    .attr("font-size", fmt_num(size))
+                    .attr("font-family", font)
+                    .attr("font-weight", weight)
+                    .attr("text-anchor", anchor);
+                el.text = Some(content);
+                let el = self.finish_shape(el, f, fo, st, so, sw, o, b, String::new(), String::new());
+                self.scene.emit(el);
+                Ok(Value::None)
+            }
 
-    /// v0.7 后处理函数：grain / vignette / blur / sharpen
-    pub fn apply_postprocess(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
-        let canvas = match &mut self.canvas {
-            Some(c) => c,
-            None => return Err(VglError::new("后处理需要先声明 canvas", self.current_pos)),
-        };
-        let (w, h) = (canvas.width, canvas.height);
-        let pixels = canvas.pixels.clone();
-        match name {
-            "grain" => {
-                // grain(intensity)：每像素随机扰动 ±intensity
-                let intensity = args.get(0).and_then(|v| v.as_number()).unwrap_or(5.0) as f32;
-                let mut rng = self.rng.borrow_mut();
-                for y in 0..h {
-                    for x in 0..w {
-                        let idx = ((y * w + x) * 4) as usize;
-                        let noise: f32 = rng.gen_range(-intensity..intensity);
-                        canvas.pixels[idx] = (pixels[idx] + noise).clamp(0.0, 255.0);
-                        canvas.pixels[idx + 1] = (pixels[idx + 1] + noise).clamp(0.0, 255.0);
-                        canvas.pixels[idx + 2] = (pixels[idx + 2] + noise).clamp(0.0, 255.0);
+            // ---------- 渐变 ----------
+            "linear_gradient" => {
+                self.arity_range(&args, 1, 1, name, pos)?;
+                let stops = self.parse_stops(&args[0], pos)?;
+                let mut d = |k: &str, default: f64| -> VglResult<f64> {
+                    match take_named(&mut named, k) {
+                        Some((v, p)) => self.num(v, p, k),
+                        None => Ok(default),
                     }
-                }
+                };
+                let x1 = d("x1", 0.0)?;
+                let y1 = d("y1", 0.0)?;
+                let x2 = d("x2", 0.0)?;
+                let y2 = d("y2", self.scene.height)?;
+                reject_unknown(&mut named, "linear_gradient", &["x1", "y1", "x2", "y2"], pos)?;
+                Ok(Value::Grad(Rc::new(GradSpec {
+                    kind: GradKind::Linear,
+                    coords: vec![x1, y1, x2, y2],
+                    stops,
+                })))
             }
-            "vignette" => {
-                // vignette(strength, radius)：边缘变暗
-                let strength = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.5) as f32;
-                let radius = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.7) as f32;
-                let cx = w as f32 / 2.0;
-                let cy = h as f32 / 2.0;
-                let max_d = (cx * cx + cy * cy).sqrt();
-                let r = radius * max_d;
-                for y in 0..h {
-                    for x in 0..w {
-                        let idx = ((y * w + x) * 4) as usize;
-                        let dx = x as f32 - cx;
-                        let dy = y as f32 - cy;
-                        let d = (dx * dx + dy * dy).sqrt();
-                        let factor = if d > r {
-                            1.0 - strength * ((d - r) / (max_d - r)).min(1.0)
-                        } else {
-                            1.0
-                        };
-                        canvas.pixels[idx] = pixels[idx] * factor;
-                        canvas.pixels[idx + 1] = pixels[idx + 1] * factor;
-                        canvas.pixels[idx + 2] = pixels[idx + 2] * factor;
+            "radial_gradient" => {
+                self.arity_range(&args, 1, 1, name, pos)?;
+                let stops = self.parse_stops(&args[0], pos)?;
+                let mut d = |k: &str, default: f64| -> VglResult<f64> {
+                    match take_named(&mut named, k) {
+                        Some((v, p)) => self.num(v, p, k),
+                        None => Ok(default),
                     }
-                }
+                };
+                let cx = d("cx", self.scene.width / 2.0)?;
+                let cy = d("cy", self.scene.height / 2.0)?;
+                let r = d("r", self.scene.width.min(self.scene.height) / 2.0)?;
+                reject_unknown(&mut named, "radial_gradient", &["cx", "cy", "r"], pos)?;
+                Ok(Value::Grad(Rc::new(GradSpec {
+                    kind: GradKind::Radial,
+                    coords: vec![cx, cy, r],
+                    stops,
+                })))
             }
-            "blur" => {
-                // blur(radius)：简单盒模糊
-                let r = args.get(0).and_then(|v| v.as_number()).unwrap_or(2.0) as i32;
-                if r > 0 {
-                    let r = r.min(20);
-                    let mut sum_r; let mut sum_g; let mut sum_b; let mut count;
-                    for y in 0..h {
-                        for x in 0..w {
-                            sum_r = 0.0; sum_g = 0.0; sum_b = 0.0; count = 0;
-                            for dy in -r..=r {
-                                let yy = y as i32 + dy;
-                                if yy < 0 || yy >= h as i32 { continue; }
-                                for dx in -r..=r {
-                                    let xx = x as i32 + dx;
-                                    if xx < 0 || xx >= w as i32 { continue; }
-                                    let idx = ((yy as u32 * w + xx as u32) * 4) as usize;
-                                    sum_r += pixels[idx];
-                                    sum_g += pixels[idx + 1];
-                                    sum_b += pixels[idx + 2];
-                                    count += 1;
-                                }
-                            }
-                            let idx = ((y * w + x) * 4) as usize;
-                            let c = count as f32;
-                            canvas.pixels[idx] = sum_r / c;
-                            canvas.pixels[idx + 1] = sum_g / c;
-                            canvas.pixels[idx + 2] = sum_b / c;
-                        }
-                    }
-                }
-            }
-            "sharpen" => {
-                // sharpen(amount)：拉普拉斯锐化
-                let amount = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.5) as f32;
-                for y in 0..h {
-                    for x in 0..w {
-                        let idx = ((y * w + x) * 4) as usize;
-                        // 中心 4，四邻 -1
-                        let get = |dx: i32, dy: i32| -> (f32, f32, f32) {
-                            let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as u32;
-                            let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as u32;
-                            let i = ((yy * w + xx) * 4) as usize;
-                            (pixels[i], pixels[i + 1], pixels[i + 2])
-                        };
-                        let (cr, cg, cb) = get(0, 0);
-                        let (ur, ug, ub) = get(0, -1);
-                        let (dr, dg, db) = get(0, 1);
-                        let (lr, lg, lb) = get(-1, 0);
-                        let (rr, rg, rb) = get(1, 0);
-                        let sharp_r = cr + amount * (4.0 * cr - ur - dr - lr - rr);
-                        let sharp_g = cg + amount * (4.0 * cg - ug - dg - lg - rg);
-                        let sharp_b = cb + amount * (4.0 * cb - ub - db - lb - rb);
-                        canvas.pixels[idx] = sharp_r.clamp(0.0, 255.0);
-                        canvas.pixels[idx + 1] = sharp_g.clamp(0.0, 255.0);
-                        canvas.pixels[idx + 2] = sharp_b.clamp(0.0, 255.0);
-                    }
-                }
-            }
-            _ => return Err(VglError::new(format!("未知后处理: {}", name), self.current_pos)),
-        }
-        Ok(())
-    }
 
-    /// v0.8 渐变填充：fill_linear_gradient / fill_radial_gradient
-    /// 直接在画布上绘制渐变，覆盖整个画布像素
-    pub fn apply_gradient(&mut self, name: &str, args: &[Value]) -> VglResult<()> {
-        // 提取颜色参数（支持 (r,g,b) 元组或 #color）
-        let extract_color = |idx: usize| -> (f32, f32, f32) {
-            match args.get(idx) {
-                Some(Value::Tuple(t)) if t.len() >= 3 => (
-                    t[0].as_number().unwrap_or(0.0) as f32,
-                    t[1].as_number().unwrap_or(0.0) as f32,
-                    t[2].as_number().unwrap_or(0.0) as f32,
-                ),
-                Some(Value::Color(r, g, b, _a)) => (*r as f32, *g as f32, *b as f32),
-                _ => (0.0, 0.0, 0.0),
-            }
-        };
-        // 提取数值参数
-        let n = |idx: usize| -> f64 {
-            args.get(idx).and_then(|v| v.as_number()).unwrap_or(0.0)
-        };
-        let canvas = match &mut self.canvas {
-            Some(c) => c,
-            None => return Err(VglError::new("渐变需要先声明 canvas", self.current_pos)),
-        };
-        match name {
-            "fill_linear_gradient" => {
-                // fill_linear_gradient(x1, y1, x2, y2, c1, c2)
-                // 沿 (x1,y1)->(x2,y2) 方向线性渐变
-                let x1 = n(0);
-                let y1 = n(1);
-                let x2 = n(2);
-                let y2 = n(3);
-                let (r1, g1, b1) = extract_color(4);
-                let (r2, g2, b2) = extract_color(5);
-                let dx = x2 - x1;
-                let dy = y2 - y1;
-                let len_sq = dx * dx + dy * dy;
-                if len_sq < 1e-10 {
-                    return Err(VglError::new("渐变起点终点重合", self.current_pos));
-                }
-                let len = len_sq.sqrt();
-                let dx = dx / len;
-                let dy = dy / len;
-                for y in 0..canvas.height {
-                    for x in 0..canvas.width {
-                        let px = x as f64;
-                        let py = y as f64;
-                        // 投影到渐变方向
-                        let t = ((px - x1) * dx + (py - y1) * dy) / len;
-                        let t = t.clamp(0.0, 1.0);
-                        let r = (r1 as f64 + (r2 - r1) as f64 * t) as f32;
-                        let g = (g1 as f64 + (g2 - g1) as f64 * t) as f32;
-                        let b = (b1 as f64 + (b2 - b1) as f64 * t) as f32;
-                        let idx = ((y * canvas.width + x) * 4) as usize;
-                        canvas.pixels[idx] = r;
-                        canvas.pixels[idx + 1] = g;
-                        canvas.pixels[idx + 2] = b;
-                        canvas.pixels[idx + 3] = 255.0;
+            // ---------- 路径工具 ----------
+            "smooth" => {
+                self.arity_range(&args, 1, 1, name, pos)?;
+                let nums = self.flat_nums(&args[0], pos, "points")?;
+                let closed = match take_named(&mut named, "closed") {
+                    Some((Value::Bool(b), _)) => b,
+                    Some((v, p)) => {
+                        return Err(VglError::new(format!("closed 需要 bool，得到 {}", v.type_name()), p))
                     }
-                }
+                    None => false,
+                };
+                reject_unknown(&mut named, "smooth", &["closed"], pos)?;
+                Ok(Value::Str(catmull_rom_d(&nums, closed)))
             }
-            "fill_radial_gradient" => {
-                // fill_radial_gradient(cx, cy, r, c1, c2)
-                // 从中心向外径向渐变
-                let cx = n(0);
-                let cy = n(1);
-                let r = n(2);
-                let (r1, g1, b1) = extract_color(3);
-                let (r2, g2, b2) = extract_color(4);
-                if r < 1e-10 {
-                    return Err(VglError::new("渐变半径必须 > 0", self.current_pos));
-                }
-                for y in 0..canvas.height {
-                    for x in 0..canvas.width {
-                        let px = x as f64;
-                        let py = y as f64;
-                        let dist = ((px - cx) * (px - cx) + (py - cy) * (py - cy)).sqrt();
-                        let t = (dist / r).clamp(0.0, 1.0);
-                        let r_ = (r1 as f64 + (r2 - r1) as f64 * t) as f32;
-                        let g_ = (g1 as f64 + (g2 - g1) as f64 * t) as f32;
-                        let b_ = (b1 as f64 + (b2 - b1) as f64 * t) as f32;
-                        let idx = ((y * canvas.width + x) * 4) as usize;
-                        canvas.pixels[idx] = r_;
-                        canvas.pixels[idx + 1] = g_;
-                        canvas.pixels[idx + 2] = b_;
-                        canvas.pixels[idx + 3] = 255.0;
-                    }
-                }
-            }
-            _ => return Err(VglError::new(format!("未知渐变: {}", name), self.current_pos)),
-        }
-        Ok(())
-    }
 
-    /// v0.8 文本绘制（5x7 点阵字体）
-    /// text(x, y, str, size, color) — size 为缩放倍数，color 为 (r,g,b) 元组
-    fn apply_text(&mut self, args: &[Value]) -> VglResult<()> {
-        let x = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-        let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-        let s = args.get(2).and_then(|v| v.as_string()).unwrap_or_default();
-        let size = args.get(3).and_then(|v| v.as_number()).unwrap_or(1.0) as i32;
-        let (r, g, b) = match args.get(4) {
-            Some(Value::Tuple(t)) if t.len() >= 3 => (
-                t[0].as_number().unwrap_or(0.0) as f32,
-                t[1].as_number().unwrap_or(0.0) as f32,
-                t[2].as_number().unwrap_or(0.0) as f32,
-            ),
-            Some(Value::Color(r, g, b, _a)) => (*r as f32, *g as f32, *b as f32),
-            _ => (255.0, 255.0, 255.0),
-        };
-        let scale = size.max(1);
-        let canvas = match &mut self.canvas {
-            Some(c) => c,
-            None => return Err(VglError::new("text 需要先声明 canvas", self.current_pos)),
-        };
-        let mut cx = x;
-        for ch in s.chars() {
-            if let Some(glyph) = get_glyph(ch) {
-                // glyph 是 [[u8; 5]; 7]，7 行 5 列
-                for (row, bits) in glyph.iter().enumerate() {
-                    for (col, &on) in bits.iter().enumerate() {
-                        if on != 0 {
-                            // 绘制 scale x scale 的方块
-                            for dy in 0..scale {
-                                for dx in 0..scale {
-                                    let px = cx + (col as i32) * scale + dx;
-                                    let py = y + (row as i32) * scale + dy;
-                                    if px >= 0 && py >= 0 && px < canvas.width as i32 && py < canvas.height as i32 {
-                                        let idx = ((py as u32 * canvas.width + px as u32) * 4) as usize;
-                                        canvas.pixels[idx] = r;
-                                        canvas.pixels[idx + 1] = g;
-                                        canvas.pixels[idx + 2] = b;
-                                        canvas.pixels[idx + 3] = 255.0;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            // ---------- 数学 ----------
+            "sin" => unary_f(args, name, pos, |x| x.sin()),
+            "cos" => unary_f(args, name, pos, |x| x.cos()),
+            "tan" => unary_f(args, name, pos, |x| x.tan()),
+            "atan2" => {
+                self.arity_range(&args, 2, 2, name, pos)?;
+                let y = self.num(args[0].clone(), pos, "y")?;
+                let x = self.num(args[1].clone(), pos, "x")?;
+                Ok(Value::Num(y.atan2(x)))
             }
-            cx += 6 * scale; // 5 列 + 1 间距
-        }
-        Ok(())
-    }
+            "abs" => unary_f(args, name, pos, |x| x.abs()),
+            "floor" => unary_f(args, name, pos, |x| x.floor()),
+            "ceil" => unary_f(args, name, pos, |x| x.ceil()),
+            "round" => unary_f(args, name, pos, |x| x.round()),
+            "sqrt" => unary_f(args, name, pos, |x| x.sqrt()),
+            "exp" => unary_f(args, name, pos, |x| x.exp()),
+            "log" => unary_f(args, name, pos, |x| x.ln()),
+            "pow" => {
+                self.arity_range(&args, 2, 2, name, pos)?;
+                let a = self.num(args[0].clone(), pos, "底数")?;
+                let b = self.num(args[1].clone(), pos, "指数")?;
+                Ok(Value::Num(a.powf(b)))
+            }
+            "min" => {
+                self.arity_range(&args, 2, 2, name, pos)?;
+                let a = self.num(args[0].clone(), pos, "min")?;
+                let b = self.num(args[1].clone(), pos, "min")?;
+                Ok(Value::Num(a.min(b)))
+            }
+            "max" => {
+                self.arity_range(&args, 2, 2, name, pos)?;
+                let a = self.num(args[0].clone(), pos, "max")?;
+                let b = self.num(args[1].clone(), pos, "max")?;
+                Ok(Value::Num(a.max(b)))
+            }
+            "clamp" => {
+                self.arity_range(&args, 3, 3, name, pos)?;
+                let v = self.num(args[0].clone(), pos, "值")?;
+                let lo = self.num(args[1].clone(), pos, "下界")?;
+                let hi = self.num(args[2].clone(), pos, "上界")?;
+                Ok(Value::Num(v.clamp(lo.min(hi), lo.max(hi))))
+            }
+            "lerp" => {
+                self.arity_range(&args, 3, 3, name, pos)?;
+                let a = self.num(args[0].clone(), pos, "lerp")?;
+                let b = self.num(args[1].clone(), pos, "lerp")?;
+                let t = self.num(args[2].clone(), pos, "lerp")?;
+                Ok(Value::Num(a + (b - a) * t))
+            }
 
-    pub fn compose_layer(&mut self, name: &str, blend: &str) -> VglResult<()> {
-        let layer_rc = match self.layers.get(name) {
-            Some(Value::Layer(lc)) => lc.clone(),
-            _ => return Err(VglError::new(format!("未找到图层: {}", name), self.current_pos)),
-        };
-        let layer = layer_rc.borrow();
-        let lw = layer.width;
-        let lh = layer.height;
-        if let Some(canvas) = &mut self.canvas {
-            if canvas.width != lw || canvas.height != lh {
-                return Err(VglError::new("图层尺寸不匹配", self.current_pos));
+            // ---------- 随机与噪声 ----------
+            "rand" => {
+                let a = args.first().cloned().map(|v| self.num(v, pos, "rand")).transpose()?;
+                let b = args.get(1).cloned().map(|v| self.num(v, pos, "rand")).transpose()?;
+                let (a, b) = (a.unwrap_or(0.0), b.unwrap_or(1.0));
+                Ok(Value::Num(self.rng.range(a, b)))
             }
-            for y in 0..lh {
-                for x in 0..lw {
-                    let idx = (y * lw + x) as usize * 4;
-                    let mr = canvas.pixels[idx];
-                    let mg = canvas.pixels[idx + 1];
-                    let mb = canvas.pixels[idx + 2];
-                    let ma = canvas.pixels[idx + 3];
-                    let lr = layer.pixels[idx];
-                    let lg = layer.pixels[idx + 1];
-                    let lb = layer.pixels[idx + 2];
-                    let la = layer.pixels[idx + 3];
-                    let (nr, ng, nb, na) = match blend {
-                        "add" => (
-                            (mr + lr).min(255.0),
-                            (mg + lg).min(255.0),
-                            (mb + lb).min(255.0),
-                            ma.max(la),
-                        ),
-                        "mul" => (
-                            mr * lr / 255.0,
-                            mg * lg / 255.0,
-                            mb * lb / 255.0,
-                            ma.max(la),
-                        ),
-                        "screen" => (
-                            255.0 - (255.0 - mr) * (255.0 - lr) / 255.0,
-                            255.0 - (255.0 - mg) * (255.0 - lg) / 255.0,
-                            255.0 - (255.0 - mb) * (255.0 - lb) / 255.0,
-                            ma.max(la),
-                        ),
-                        // v0.7 混合模式扩展
-                        "overlay" => (
-                            if mr < 128.0 { 2.0 * mr * lr / 255.0 } else { 255.0 - 2.0 * (255.0 - mr) * (255.0 - lr) / 255.0 },
-                            if mg < 128.0 { 2.0 * mg * lg / 255.0 } else { 255.0 - 2.0 * (255.0 - mg) * (255.0 - lg) / 255.0 },
-                            if mb < 128.0 { 2.0 * mb * lb / 255.0 } else { 255.0 - 2.0 * (255.0 - mb) * (255.0 - lb) / 255.0 },
-                            ma.max(la),
-                        ),
-                        "soft_light" => (
-                            (mr + lr * (mr - 0.5 * 255.0) / 127.5).clamp(0.0, 255.0),
-                            (mg + lg * (mg - 0.5 * 255.0) / 127.5).clamp(0.0, 255.0),
-                            (mb + lb * (mb - 0.5 * 255.0) / 127.5).clamp(0.0, 255.0),
-                            ma.max(la),
-                        ),
-                        "hard_light" => (
-                            if lr < 128.0 { 2.0 * mr * lr / 255.0 } else { 255.0 - 2.0 * (255.0 - mr) * (255.0 - lr) / 255.0 },
-                            if lg < 128.0 { 2.0 * mg * lg / 255.0 } else { 255.0 - 2.0 * (255.0 - mg) * (255.0 - lg) / 255.0 },
-                            if lb < 128.0 { 2.0 * mb * lb / 255.0 } else { 255.0 - 2.0 * (255.0 - mb) * (255.0 - lb) / 255.0 },
-                            ma.max(la),
-                        ),
-                        "color_dodge" => (
-                            if lr == 255.0 { 255.0 } else { (mr * 255.0 / (255.0 - lr)).min(255.0) },
-                            if lg == 255.0 { 255.0 } else { (mg * 255.0 / (255.0 - lg)).min(255.0) },
-                            if lb == 255.0 { 255.0 } else { (mb * 255.0 / (255.0 - lb)).min(255.0) },
-                            ma.max(la),
-                        ),
-                        "color_burn" => (
-                            if lr == 0.0 { 0.0 } else { (255.0 - (255.0 - mr) * 255.0 / lr).max(0.0) },
-                            if lg == 0.0 { 0.0 } else { (255.0 - (255.0 - mg) * 255.0 / lg).max(0.0) },
-                            if lb == 0.0 { 0.0 } else { (255.0 - (255.0 - mb) * 255.0 / lb).max(0.0) },
-                            ma.max(la),
-                        ),
-                        "linear_burn" => (
-                            (mr + lr - 255.0).max(0.0),
-                            (mg + lg - 255.0).max(0.0),
-                            (mb + lb - 255.0).max(0.0),
-                            ma.max(la),
-                        ),
-                        "difference" => (
-                            (mr - lr).abs(),
-                            (mg - lg).abs(),
-                            (mb - lb).abs(),
-                            ma.max(la),
-                        ),
-                        "exclusion" => (
-                            mr + lr - 2.0 * mr * lr / 255.0,
-                            mg + lg - 2.0 * mg * lg / 255.0,
-                            mb + lb - 2.0 * mb * lb / 255.0,
-                            ma.max(la),
-                        ),
-                        _ => {
-                            // over: 真 alpha 合成
-                            // src = layer (lr,lg,lb,la)，dst = canvas (mr,mg,mb,ma)
-                            let sa = la / 255.0;
-                            let da = ma / 255.0;
-                            let out_a = sa + da * (1.0 - sa);
-                            if out_a <= 0.0 {
-                                (0.0, 0.0, 0.0, 0.0)
-                            } else {
-                                let or = (lr * sa + mr * da * (1.0 - sa)) / out_a;
-                                let og = (lg * sa + mg * da * (1.0 - sa)) / out_a;
-                                let ob = (lb * sa + mb * da * (1.0 - sa)) / out_a;
-                                (or, og, ob, out_a * 255.0)
-                            }
+            "rand_int" => {
+                self.arity_range(&args, 2, 2, name, pos)?;
+                let a = self.num(args[0].clone(), pos, "rand_int")?.round();
+                let b = self.num(args[1].clone(), pos, "rand_int")?.round();
+                let v = self.rng.range(a, b + 1.0).floor();
+                Ok(Value::Num(v.max(a).min(b)))
+            }
+            "perlin" => {
+                self.arity_range(&args, 2, 2, name, pos)?;
+                let x = self.num(args[0].clone(), pos, "x")?;
+                let y = self.num(args[1].clone(), pos, "y")?;
+                Ok(Value::Num(perlin(x, y, &self.perm)))
+            }
+            "fbm" => {
+                self.arity_range(&args, 2, 3, name, pos)?;
+                let x = self.num(args[0].clone(), pos, "x")?;
+                let y = self.num(args[1].clone(), pos, "y")?;
+                let oct = match args.get(2) {
+                    Some(v) => self.num(v.clone(), pos, "octaves")? as i32,
+                    None => 4,
+                };
+                Ok(Value::Num(fbm(x, y, oct, &self.perm)))
+            }
+
+            // ---------- 颜色 ----------
+            "color" => {
+                if args.len() == 1 {
+                    let s = match &args[0] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(VglError::new(
+                                format!("color 单参数形式需要 \"#hex\" 字符串，得到 {}", other.type_name()),
+                                pos,
+                            ))
                         }
                     };
-                    canvas.pixels[idx] = nr.max(0.0).min(255.0);
-                    canvas.pixels[idx + 1] = ng.max(0.0).min(255.0);
-                    canvas.pixels[idx + 2] = nb.max(0.0).min(255.0);
-                    canvas.pixels[idx + 3] = na.max(0.0).min(255.0);
+                    return parse_hex_color(&s)
+                        .map(Value::Color)
+                        .ok_or_else(|| VglError::new(format!("非法颜色 '{}'", s), pos));
+                }
+                self.arity_range(&args, 3, 4, name, pos)?;
+                let r = self.num(args[0].clone(), pos, "r")?;
+                let g = self.num(args[1].clone(), pos, "g")?;
+                let b = self.num(args[2].clone(), pos, "b")?;
+                let a = match args.get(3) {
+                    Some(v) => self.num(v.clone(), pos, "alpha")?,
+                    None => 1.0,
+                };
+                Ok(Value::Color(Color::new(r, g, b, a)))
+            }
+            "lighten" | "darken" => {
+                self.arity_range(&args, 2, 2, name, pos)?;
+                let c = self.color_arg(&args[0], pos)?;
+                let amt = self.num(args[1].clone(), pos, "amount")?.clamp(0.0, 1.0);
+                let target = if name == "lighten" { 255.0 } else { 0.0 };
+                let mix = |v: f64| v + (target - v) * amt;
+                Ok(Value::Color(Color::new(mix(c.r), mix(c.g), mix(c.b), c.a)))
+            }
+            "lerp_color" => {
+                self.arity_range(&args, 3, 3, name, pos)?;
+                let a = self.color_arg(&args[0], pos)?;
+                let b = self.color_arg(&args[1], pos)?;
+                let t = self.num(args[2].clone(), pos, "t")?;
+                let m = |x, y| x + (y - x) * t;
+                Ok(Value::Color(Color::new(m(a.r, b.r), m(a.g, b.g), m(a.b, b.b), m(a.a, b.a))))
+            }
+            "alpha" => {
+                self.arity_range(&args, 2, 2, name, pos)?;
+                let c = self.color_arg(&args[0], pos)?;
+                let a = self.num(args[1].clone(), pos, "alpha")?;
+                Ok(Value::Color(Color::new(c.r, c.g, c.b, a)))
+            }
+            "red" | "green" | "blue" => {
+                self.arity_range(&args, 1, 1, name, pos)?;
+                let c = self.color_arg(&args[0], pos)?;
+                Ok(Value::Num(match name {
+                    "red" => c.r,
+                    "green" => c.g,
+                    _ => c.b,
+                }))
+            }
+
+            // ---------- 画布与工具 ----------
+            "width" => Ok(Value::Num(self.scene.width)),
+            "height" => Ok(Value::Num(self.scene.height)),
+            "len" => {
+                self.arity_range(&args, 1, 1, name, pos)?;
+                match &args[0] {
+                    Value::Arr(a) => Ok(Value::Num(a.borrow().len() as f64)),
+                    Value::Str(s) => Ok(Value::Num(s.chars().count() as f64)),
+                    other => Err(VglError::new(
+                        format!("len 需要数组或字符串，得到 {}", other.type_name()),
+                        pos,
+                    )),
                 }
             }
+            "push" => {
+                self.arity_range(&args, 2, 2, name, pos)?;
+                match &args[0] {
+                    Value::Arr(a) => {
+                        a.borrow_mut().push(args[1].clone());
+                        Ok(Value::None)
+                    }
+                    other => Err(VglError::new(
+                        format!("push 第一个参数需要数组，得到 {}", other.type_name()),
+                        pos,
+                    )),
+                }
+            }
+            "print" => {
+                self.arity_range(&args, 1, 1, name, pos)?;
+                eprintln!("{}", display(&args[0]));
+                Ok(Value::None)
+            }
+            _ => Err(VglError::new(format!("未定义的函数 '{}'", name), pos)),
         }
-        Ok(())
     }
 
-    pub fn fill_field(&mut self, name: &str, env: Rc<RefCell<Env>>) -> VglResult<()> {
-        let closure = env.borrow().get(name);
-        let (params, body, def_env) = match closure {
-            Some(Value::Closure(_, p, b, e)) => (p, b, e),
-            _ => return Err(VglError::new(format!("未找到颜色场: {}", name), self.current_pos)),
+    /// 从命名参数提取形状通用参数（shape_common 的入口包装，检查未知命名参数由调用方完成）
+    fn shape_common_named(
+        &mut self,
+        named: &mut Vec<(String, Value, usize)>,
+        default_fill: bool,
+        pos: usize,
+    ) -> VglResult<(String, Option<f64>, String, Option<f64>, f64, f64, f64, String, String)> {
+        self.shape_common(named, default_fill, pos)
+    }
+
+    fn parse_stops(&mut self, v: &Value, pos: usize) -> VglResult<Vec<(Color, f64)>> {
+        let arr = match v {
+            Value::Arr(a) => a.borrow().clone(),
+            other => {
+                return Err(VglError::new(
+                    format!("渐变 stops 需要颜色数组，得到 {}", other.type_name()),
+                    pos,
+                ))
+            }
         };
-        let (w, h) = match &self.canvas {
-            Some(c) => (c.width, c.height),
-            None => return Ok(()),
-        };
-        for y in 0..h {
-            for x in 0..w {
-                let call_env = Rc::new(RefCell::new(Env::new(Some(def_env.clone()))));
-                if !params.is_empty() {
-                    call_env.borrow_mut().vars.insert(params[0].0.clone(), Value::Number(x as f64));
+        if arr.is_empty() {
+            return Err(VglError::new("渐变至少需要一个颜色", pos));
+        }
+        // 先收集 (颜色, 可选偏移)
+        let mut raw: Vec<(Color, Option<f64>)> = Vec::new();
+        for item in &arr {
+            match item {
+                Value::Color(c) => raw.push((*c, None)),
+                Value::Str(s) => {
+                    let c = parse_hex_color(s)
+                        .ok_or_else(|| VglError::new(format!("非法颜色 '{}'", s), pos))?;
+                    raw.push((c, None));
                 }
-                if params.len() > 1 {
-                    call_env.borrow_mut().vars.insert(params[1].0.clone(), Value::Number(y as f64));
-                }
-                let result = match self.execute_block(&body, call_env) {
-                    Ok(Control::Return(v)) => v,
-                    Ok(_) => Value::None,
-                    Err(_) => Value::None,
-                };
-                let color = match result {
-                    Value::Color(r, g, b, _a) => Some((r as f32, g as f32, b as f32)),
-                    Value::Tuple(ref t) if t.len() >= 3 => Some((
-                        clamp_f32(t.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                        clamp_f32(t.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                        clamp_f32(t.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as f32),
-                    )),
-                    _ => None,
-                };
-                if let Some((r, g, b)) = color {
-                    if let Some(canvas) = &mut self.canvas {
-                        canvas.put_pixel(x as i32, y as i32, r, g, b);
+                Value::Arr(pair) => {
+                    // [color, offset]
+                    if pair.borrow().len() != 2 {
+                        return Err(VglError::new("渐变 stop 二元组应为 [颜色, 偏移]", pos));
                     }
+                    let c = self.color_arg(&pair.borrow()[0], pos)?;
+                    let off = self.num(pair.borrow()[1].clone(), pos, "偏移")?;
+                    raw.push((c, Some(off)));
+                }
+                other => {
+                    return Err(VglError::new(
+                        format!("渐变 stop 应为颜色或 [颜色, 偏移]，得到 {}", other.type_name()),
+                        pos,
+                    ))
                 }
             }
         }
-        Ok(())
+        // 未给偏移的均匀分布
+        let n = raw.len();
+        let mut stops = Vec::new();
+        for (i, (c, off)) in raw.into_iter().enumerate() {
+            let o = off.unwrap_or(if n == 1 { 0.0 } else { i as f64 / (n - 1) as f64 });
+            stops.push((c, o.clamp(0.0, 1.0)));
+        }
+        stops.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(stops)
+    }
+
+    fn color_arg(&self, v: &Value, pos: usize) -> VglResult<Color> {
+        match v {
+            Value::Color(c) => Ok(*c),
+            Value::Str(s) => parse_hex_color(s)
+                .ok_or_else(|| VglError::new(format!("非法颜色 '{}'", s), pos)),
+            other => Err(VglError::new(
+                format!("需要颜色，得到 {}", other.type_name()),
+                pos,
+            )),
+        }
+    }
+
+    fn arity(&self, args: &[Value], n: usize, fname: &str, pos: usize) -> VglResult<()> {
+        if args.len() != n {
+            Err(VglError::new(
+                format!("{} 需要 {} 个参数，得到 {}", fname, n, args.len()),
+                pos,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn arity_range(
+        &self,
+        args: &[Value],
+        lo: usize,
+        hi: usize,
+        fname: &str,
+        pos: usize,
+    ) -> VglResult<()> {
+        if args.len() < lo || args.len() > hi {
+            Err(VglError::new(
+                format!("{} 需要 {}~{} 个参数，得到 {}", fname, lo, hi, args.len()),
+                pos,
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
-// ============================================================
-// v0.8 5x7 点阵字体
-// 每个字符 7 行 x 5 列，1=点亮 0=灭
-// 支持 A-Z, a-z, 0-9, 空格及常见标点
-// ============================================================
+// ==================== 辅助函数 ====================
 
-fn get_glyph(c: char) -> Option<&'static [[u8; 5]; 7]> {
-    let g: &'static [[u8; 5]; 7] = match c {
-        // ---------- 大写字母 A-Z ----------
-        'A' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'B' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        'C' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        'D' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        'E' => &[
-            [0,1,1,1,1],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,1],
-        ],
-        'F' => &[
-            [0,1,1,1,1],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-        ],
-        'G' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,0],
-            [0,1,0,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        'H' => &[
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'I' => &[
-            [0,1,1,1,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,1,1,1,0],
-        ],
-        'J' => &[
-            [0,0,1,1,1],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,1,0,1,0],
-            [0,0,1,1,0],
-        ],
-        'K' => &[
-            [0,1,0,0,1],
-            [0,1,0,1,0],
-            [0,1,1,0,0],
-            [0,1,1,0,0],
-            [0,1,0,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'L' => &[
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,1],
-        ],
-        'M' => &[
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-            [0,1,0,1,1],
-            [0,1,0,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'N' => &[
-            [0,1,0,0,1],
-            [0,1,1,0,1],
-            [0,1,1,0,1],
-            [0,1,0,1,1],
-            [0,1,0,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'O' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        'P' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-        ],
-        'Q' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,1,1],
-            [0,1,1,0,1],
-            [0,0,0,0,1],
-        ],
-        'R' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-            [0,1,0,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'S' => &[
-            [0,1,1,1,1],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,0,0,0,1],
-            [0,0,0,0,1],
-            [0,1,1,1,1],
-        ],
-        'T' => &[
-            [0,1,1,1,1],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-        ],
-        'U' => &[
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-        ],
-        'V' => &[
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-        ],
-        'W' => &[
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,1,1],
-            [0,1,0,1,1],
-            [0,1,1,1,1],
-            [0,1,0,0,1],
-        ],
-        'X' => &[
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-            [0,0,1,0,0],
-            [0,0,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'Y' => &[
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-        ],
-        'Z' => &[
-            [0,1,1,1,1],
-            [0,0,0,0,1],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,1],
-        ],
-        // ---------- 小写字母 a-z ----------
-        'a' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,0],
-            [0,0,0,0,1],
-            [0,1,1,1,1],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-        ],
-        'b' => &[
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        'c' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,1],
-        ],
-        'd' => &[
-            [0,0,0,0,1],
-            [0,0,0,0,1],
-            [0,1,1,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-        ],
-        'e' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-            [0,1,0,0,0],
-            [0,1,1,1,1],
-        ],
-        'f' => &[
-            [0,0,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-        ],
-        'g' => &[
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-            [0,0,0,0,1],
-            [0,1,1,1,0],
-        ],
-        'h' => &[
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'i' => &[
-            [0,0,1,0,0],
-            [0,0,0,0,0],
-            [0,1,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,1,1,1,0],
-        ],
-        'j' => &[
-            [0,0,0,1,0],
-            [0,0,0,0,0],
-            [0,0,1,1,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,1,0,1,0],
-            [0,0,1,1,0],
-        ],
-        'k' => &[
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,1],
-            [0,1,0,1,0],
-            [0,1,1,0,0],
-            [0,1,0,1,0],
-            [0,1,0,0,1],
-        ],
-        'l' => &[
-            [0,1,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,1,1,1,0],
-        ],
-        'm' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,0,1],
-            [0,1,0,1,1],
-            [0,1,0,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'n' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'o' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        'p' => &[
-            [0,0,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-        ],
-        'q' => &[
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-            [0,0,0,0,1],
-            [0,0,0,0,1],
-        ],
-        'r' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-            [0,1,0,0,1],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-        ],
-        's' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,0,0,0,1],
-            [0,1,1,1,0],
-        ],
-        't' => &[
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-        ],
-        'u' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,1,1],
-            [0,0,1,0,1],
-        ],
-        'v' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-        ],
-        'w' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,1,1],
-            [0,1,0,1,1],
-            [0,0,1,0,1],
-        ],
-        'x' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-        ],
-        'y' => &[
-            [0,0,0,0,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,0,1,1,1],
-            [0,0,0,0,1],
-            [0,1,1,1,0],
-        ],
-        'z' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,1],
-        ],
-        // ---------- 数字 0-9 ----------
-        '0' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,0,1,1],
-            [0,1,1,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        '1' => &[
-            [0,0,1,0,0],
-            [0,1,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,1,1,1,0],
-        ],
-        '2' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,0,0,0,1],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,1],
-        ],
-        '3' => &[
-            [0,1,1,1,1],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,0,0,1,0],
-            [0,0,0,0,1],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-        ],
-        '4' => &[
-            [0,0,0,1,0],
-            [0,0,1,1,0],
-            [0,1,0,1,0],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-        ],
-        '5' => &[
-            [0,1,1,1,1],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,0,0,0,1],
-            [0,0,0,0,1],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-        ],
-        '6' => &[
-            [0,0,1,1,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-        ],
-        '7' => &[
-            [0,1,1,1,1],
-            [0,0,0,0,1],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-        ],
-        '8' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        '9' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,0,1],
-            [0,1,1,1,1],
-            [0,0,0,0,1],
-            [0,0,0,1,0],
-            [0,1,1,0,0],
-        ],
-        // ---------- 标点符号 ----------
-        ' ' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-        ],
-        '.' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-        ],
-        ',' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-        ],
-        '!' => &[
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,0,0,0],
-            [0,0,1,0,0],
-        ],
-        '?' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,0,0,0,1],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,0,0,0,0],
-            [0,0,1,0,0],
-        ],
-        ':' => &[
-            [0,0,0,0,0],
-            [0,0,1,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,1,0,0],
-            [0,0,0,0,0],
-        ],
-        ';' => &[
-            [0,0,0,0,0],
-            [0,0,1,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-        ],
-        '-' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-        ],
-        '+' => &[
-            [0,0,0,0,0],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,1,1,1,1],
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,0,0,0],
-        ],
-        '/' => &[
-            [0,0,0,0,1],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-        ],
-        '(' => &[
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,0,1,0,0],
-            [0,0,0,1,0],
-        ],
-        ')' => &[
-            [0,1,0,0,0],
-            [0,0,1,0,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-        ],
-        '=' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-        ],
-        '*' => &[
-            [0,0,0,0,0],
-            [0,1,0,0,1],
-            [0,0,1,1,0],
-            [0,0,1,0,0],
-            [0,0,1,1,0],
-            [0,1,0,0,1],
-            [0,0,0,0,0],
-        ],
-        '#' => &[
-            [0,1,0,1,0],
-            [0,1,0,1,0],
-            [0,1,1,1,1],
-            [0,1,0,1,0],
-            [0,1,1,1,1],
-            [0,1,0,1,0],
-            [0,1,0,1,0],
-        ],
-        '@' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,1],
-            [0,1,0,1,1],
-            [0,1,0,1,1],
-            [0,1,0,1,1],
-            [0,1,0,0,0],
-            [0,0,1,1,0],
-        ],
-        '\'' => &[
-            [0,0,1,0,0],
-            [0,0,1,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-        ],
-        '"' => &[
-            [0,1,0,1,0],
-            [0,1,0,1,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-        ],
-        '<' => &[
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,0,1,0,0],
-            [0,0,0,1,0],
-        ],
-        '>' => &[
-            [0,1,0,0,0],
-            [0,0,1,0,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-        ],
-        '[' => &[
-            [0,1,1,1,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-        ],
-        ']' => &[
-            [0,1,1,1,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,0,0,1,0],
-            [0,1,1,1,0],
-        ],
-        '_' => &[
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,0,0,0,0],
-            [0,1,1,1,1],
-        ],
-        '%' => &[
-            [0,1,1,0,1],
-            [0,1,1,1,0],
-            [0,0,0,1,0],
-            [0,0,1,0,0],
-            [0,1,0,0,0],
-            [0,1,1,1,0],
-            [0,1,0,1,1],
-        ],
-        '&' => &[
-            [0,1,1,0,0],
-            [0,1,0,1,0],
-            [0,1,0,1,0],
-            [0,1,1,0,0],
-            [0,1,0,1,0],
-            [0,1,0,0,1],
-            [0,1,1,1,0],
-        ],
-        '$' => &[
-            [0,0,1,0,0],
-            [0,1,1,1,1],
-            [0,1,0,1,0],
-            [0,1,1,1,0],
-            [0,0,1,0,1],
-            [0,1,1,1,1],
-            [0,0,1,0,0],
-        ],
-        _ => return None,
+fn take_named(named: &mut Vec<(String, Value, usize)>, key: &str) -> Option<(Value, usize)> {
+    let idx = named.iter().position(|(k, _, _)| k == key)?;
+    let (_, v, p) = named.remove(idx);
+    Some((v, p))
+}
+
+fn reject_unknown(
+    named: &[(String, Value, usize)],
+    fname: &str,
+    allowed: &[&str],
+    pos: usize,
+) -> VglResult<()> {
+    for (k, _, _) in named {
+        if !allowed.contains(&k.as_str()) {
+            return Err(VglError::new(
+                format!("{} 不支持命名参数 '{}'（可用: {}）", fname, k, allowed.join(", ")),
+                pos,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn env_visibility(env: &Rc<RefCell<Env>>, name: &str) -> Option<Value> {
+    Env::lookup(env, name)
+}
+
+fn unary_f(
+    args: Vec<Value>,
+    fname: &str,
+    pos: usize,
+    f: impl Fn(f64) -> f64,
+) -> VglResult<Value> {
+    if args.len() != 1 {
+        return Err(VglError::new(format!("{} 需要 1 个参数，得到 {}", fname, args.len()), pos));
+    }
+    match args[0] {
+        Value::Num(x) => Ok(Value::Num(f(x))),
+        ref other => Err(VglError::new(
+            format!("{} 需要数字，得到 {}", fname, other.type_name()),
+            pos,
+        )),
+    }
+}
+
+fn display(v: &Value) -> String {
+    match v {
+        Value::Num(n) => fmt_num(*n),
+        Value::Bool(b) => b.to_string(),
+        Value::Str(s) => s.clone(),
+        Value::Color(c) => c.hex(),
+        Value::None => "none".to_string(),
+        Value::Arr(a) => {
+            let items: Vec<String> = a.borrow().iter().map(display).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Value::Fn(f) => format!("<fn {}>", f.name),
+        Value::Grad(_) => "<gradient>".to_string(),
+    }
+}
+
+fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Num(x), Value::Num(y)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Color(x), Value::Color(y)) => {
+            x.r == y.r && x.g == y.g && x.b == y.b && x.a == y.a
+        }
+        (Value::None, Value::None) => true,
+        (Value::Arr(x), Value::Arr(y)) => {
+            let xb = x.borrow();
+            let yb = y.borrow();
+            xb.len() == yb.len() && xb.iter().zip(yb.iter()).all(|(a, b)| values_eq(a, b))
+        }
+        (Value::Grad(x), Value::Grad(y)) => Rc::ptr_eq(x, y),
+        (Value::Fn(x), Value::Fn(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+fn join_path(dir: &str, file: &str) -> String {
+    if file.starts_with('/') || file.starts_with("\\") {
+        return file.to_string();
+    }
+    let d = dir.trim_end_matches('/');
+    format!("{}/{}", d, file)
+}
+
+/// Catmull-Rom 样条 → SVG path d（三次贝塞尔）
+fn catmull_rom_d(nums: &[f64], closed: bool) -> String {
+    let pts: Vec<(f64, f64)> = nums
+        .chunks(2)
+        .filter(|c| c.len() == 2)
+        .map(|c| (c[0], c[1]))
+        .collect();
+    let n = pts.len();
+    if n < 2 {
+        return String::new();
+    }
+    if n == 2 {
+        return format!(
+            "M{} {} L{} {}",
+            fmt_num(pts[0].0),
+            fmt_num(pts[0].1),
+            fmt_num(pts[1].0),
+            fmt_num(pts[1].1)
+        );
+    }
+    let get = |i: isize| -> (f64, f64) {
+        if closed {
+            pts[(i.rem_euclid(n as isize)) as usize]
+        } else if i < 0 {
+            pts[0]
+        } else if i as usize >= n {
+            pts[n - 1]
+        } else {
+            pts[i as usize]
+        }
     };
-    Some(g)
+    let segs = if closed { n } else { n - 1 };
+    let mut d = format!("M{} {}", fmt_num(pts[0].0), fmt_num(pts[0].1));
+    for i in 0..segs {
+        let p0 = get(i as isize - 1);
+        let p1 = get(i as isize);
+        let p2 = get(i as isize + 1);
+        let p3 = get(i as isize + 2);
+        let c1 = (p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0);
+        let c2 = (p2.0 - (p3.0 - p1.0) / 6.0, p2.1 - (p3.1 - p1.1) / 6.0);
+        d.push_str(&format!(
+            " C{} {} {} {} {} {}",
+            fmt_num(c1.0),
+            fmt_num(c1.1),
+            fmt_num(c2.0),
+            fmt_num(c2.1),
+            fmt_num(p2.0),
+            fmt_num(p2.1)
+        ));
+    }
+    if closed {
+        d.push_str(" Z");
+    }
+    d
 }

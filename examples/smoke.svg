@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600">
+<defs>
+  <linearGradient id="g0" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="600"><stop offset="0" stop-color="#1e143c"/><stop offset="100" stop-color="#ffb464"/></linearGradient>
+  <radialGradient id="g1" gradientUnits="userSpaceOnUse" cx="400" cy="300" r="300"><stop offset="0" stop-color="#ffdc96"/><stop offset="50" stop-color="#ffb464" stop-opacity="0.4"/><stop offset="100" stop-color="#ffb464" stop-opacity="0"/></radialGradient>
+</defs>
+  <rect x="0" y="0" width="800" height="600" fill="url(#g0)"/>
+  <rect x="50" y="50" width="120" height="80" rx="10" fill="#ff6b6b" opacity="0.9"/>
+  <circle cx="200" cy="200" r="40" fill="#4ecdc4"/>
+  <ellipse cx="320" cy="200" rx="50" ry="25" fill="none" stroke="#ffe66e" stroke-width="3"/>
+  <line x1="50" y1="300" x2="400" y2="300" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+  <polygon points="500,50 600,150 400,150" fill="#95e1d3" opacity="0.8"/>
+  <polyline points="650,50 700,120 760,60 780,150" fill="none" stroke="#ff6b6b" stroke-width="4" stroke-linejoin="round"/>
+  <text x="400" y="380" font-size="28" font-family="sans-serif" font-weight="bold" text-anchor="middle" fill="#ffffff">VGL v2.0 — Hello Vector</text>
+  <circle cx="650" cy="420" r="60" fill="url(#g1)"/>
+  <circle cx="60" cy="450" r="8" fill="#ff6b6b" opacity="0.7"/>
+  <circle cx="130" cy="450" r="7.501" fill="#4ecdc4" opacity="0.7"/>
+  <circle cx="200" cy="450" r="6.566" fill="#ffe66e" opacity="0.7"/>
+  <circle cx="270" cy="450" r="8.045" fill="#95e1d3" opacity="0.7"/>
+  <circle cx="340" cy="450" r="8.007" fill="#ff6b6b" opacity="0.7"/>
+  <circle cx="410" cy="450" r="9.6" fill="#4ecdc4" opacity="0.7"/>
+  <circle cx="480" cy="450" r="8.464" fill="#ffe66e" opacity="0.7"/>
+  <circle cx="550" cy="450" r="8.033" fill="#95e1d3" opacity="0.7"/>
+  <circle cx="620" cy="450" r="7.364" fill="#ff6b6b" opacity="0.7"/>
+  <circle cx="690" cy="450" r="8.523" fill="#4ecdc4" opacity="0.7"/>
+  <circle cx="60" cy="520" r="7.536" fill="#ff6b6b" opacity="0.7"/>
+  <circle cx="130" cy="520" r="6.198" fill="#4ecdc4" opacity="0.7"/>
+  <circle cx="200" cy="520" r="5.677" fill="#ffe66e" opacity="0.7"/>
+  <circle cx="270" cy="520" r="7.67" fill="#95e1d3" opacity="0.7"/>
+  <circle cx="340" cy="520" r="9.283" fill="#ff6b6b" opacity="0.7"/>
+  <circle cx="410" cy="520" r="9.39" fill="#4ecdc4" opacity="0.7"/>
+  <circle cx="480" cy="520" r="9.446" fill="#ffe66e" opacity="0.7"/>
+  <circle cx="550" cy="520" r="9.22" fill="#95e1d3" opacity="0.7"/>
+  <g transform="translate(400,560) rotate(15)">
+    <rect x="-40" y="-15" width="80" height="30" rx="6" fill="#4ecdc4"/>
+    <text x="0" y="6" font-size="14" font-family="sans-serif" font-weight="normal" text-anchor="middle" fill="#1a1a2e">group</text>
+  </g>
+  <path d="M60 590 C66 590.956 84 594.406 96 595.739 C108 597.072 120 598.052 132 597.997 C144 597.941 156 596.814 168 595.404 C180 593.993 192 591.443 204 589.533 C216 587.623 228 585.196 240 583.946 C252 582.695 264 581.863 276 582.031 C288 582.198 300 583.466 312 584.95 C324 586.433 336 589.032 348 590.932 C360 592.832 372 595.186 384 596.349 C396 597.513 408 598.193 420 597.915 C432 597.637 444 596.231 456 594.679 C468 593.128 480 590.489 492 588.605 C504 586.722 516 584.451 528 583.377 C540 582.304 552 581.778 564 582.167 C576 582.555 588 584.093 600 585.707 C612 587.322 624 589.991 636 591.852 C648 593.713 660 595.894 672 596.873 C684 597.852 696 598.222 708 597.725 C720 597.228 738 594.53 744 593.891" fill="none" stroke="#ffffff" stroke-width="2" opacity="0.6"/>
+</svg>

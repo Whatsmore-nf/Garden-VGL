@@ -1,147 +1,111 @@
 // ============================================================
-// sky.vgl — 语义化天空生成库
-// 天空渐变、太阳、月亮、星星、云、极光
-// 用法: import "lib/sky.vgl"
-// v1.0: 默认参数 + color() + for 循环
+// sky.vgl — 语义化天空矢量库
+// 天空渐变 / 太阳 / 月亮 / 星空 / 流星 / 云 / 极光
+// 用法: use "lib/sky.vgl"
+// 全部输出 SVG 原语：渐变、路径、滤镜，无限缩放
 // ============================================================
 
-module Sky {
-
-// 线性渐变天空（从上到下）
-fn gradient(top = color(30, 20, 60), bottom = color(255, 180, 100)) {
-    let h = height()
-    fill_linear_gradient(0, 0, 0, h, bottom, top)
+// 天空底色：垂直线性渐变铺满画布
+fn sky(top = color(34, 24, 64), bottom = color(255, 170, 110)) {
+    background(linear_gradient([top, bottom]))
 }
 
-// 径向光晕天空
-fn radial(cx, cy, radius, inner, outer) {
-    fill_radial_gradient(cx, cy, radius, inner, outer)
+// 太阳：双层径向渐变（大光晕 + 亮核）
+fn sun(x, y, r = 36, col = color(255, 214, 130)) {
+    let halo = radial_gradient([alpha(col, 0), alpha(col, 0.35), alpha(col, 0)], cx: x, cy: y, r: r * 6)
+    circle(x, y, r * 6, fill: halo)
+    let core = radial_gradient([lighten(col, 0.5), col], cx: x, cy: y, r: r)
+    circle(x, y, r, fill: core)
 }
 
-// 太阳：径向渐变 + 多层光晕
-fn sun(x, y, radius = 30, color = color(255, 220, 150)) {
-    fill_radial_gradient(x, y, radius * 3, color, darken(color, 0.8))
-    fill_radial_gradient(x, y, radius, brighten(color, 0.3), color)
-    fill_radial_gradient(x, y, radius * 0.4, brighten(color, 0.6), brighten(color, 0.2))
+// 月亮：光晕 + 本体 + 环形山阴影
+fn moon(x, y, r = 26, col = color(238, 238, 224)) {
+    let glow = radial_gradient([alpha(col, 0), alpha(col, 0.22), alpha(col, 0)], cx: x, cy: y, r: r * 4)
+    circle(x, y, r * 4, fill: glow)
+    let body = radial_gradient([lighten(col, 0.25), col], cx: x - r * 0.25, cy: y - r * 0.25, r: r * 1.1)
+    circle(x, y, r, fill: body)
+    // 环形山：几处略暗的圆
+    circle(x - r * 0.3, y - r * 0.15, r * 0.18, fill: darken(col, 0.12), opacity: 0.7)
+    circle(x + r * 0.25, y + r * 0.3, r * 0.12, fill: darken(col, 0.12), opacity: 0.6)
+    circle(x + r * 0.1, y - r * 0.4, r * 0.09, fill: darken(col, 0.12), opacity: 0.5)
 }
 
-// 月亮
-fn moon(x, y, radius = 25, color = color(240, 240, 220)) {
-    fill_radial_gradient(x - radius * 0.2, y - radius * 0.2, radius, brighten(color, 0.2), color)
-    fill_radial_gradient(x, y, radius * 2.5, darken(color, 0.3), darken(color, 0.6))
-}
-
-// 星空
-fn stars(count = 100, max_brightness = 0.8) {
+// 星空：小圆点 + 亮星四芒闪光
+fn stars(count = 120, y_ratio = 0.75, max_b = 0.9) {
     let w = width()
     let h = height()
     for i in 0..count {
         let x = rand(0, w)
-        let y = rand(0, h * 0.7)
-        let b = rand(0.3, max_brightness)
-        let r = rand(0.5, 2.0)
-        fill_circle(x, y, r, (255 * b, 255 * b, 255 * b))
-        if b > 0.7 {
-            fill_circle(x, y, r * 2, (255 * b * 0.3, 255 * b * 0.3, 255 * b * 0.3))
+        let y = rand(0, h * y_ratio)
+        let b = rand(0.25, max_b)
+        if b > 0.78 {
+            // 亮星：四芒
+            let s = rand(4, 9)
+            polygon([x, y - s, x + s * 0.22, y, x, y + s, x - s * 0.22, y], fill: "#ffffff", opacity: b)
+            circle(x, y, s * 0.18, fill: "#ffffff", opacity: b)
+        } else {
+            circle(x, y, rand(0.6, 1.6), fill: "#ffffff", opacity: b)
         }
     }
 }
 
-// 流星
-fn meteor(x, y, length = 100, angle = 0.5, color = color(255, 240, 200)) {
-    let dx = cos(angle) * length
-    let dy = sin(angle) * length
-    for i in 0..20 {
-        let t = i / 20
-        let px = x + dx * t
-        let py = y + dy * t
-        let alpha = 1.0 - t
-        fill_circle(px, py, (1.0 - t) * 2.0, (color[0] * alpha, color[1] * alpha, color[2] * alpha))
-    }
+// 流星：渐变尾迹 + 亮头
+fn meteor(x, y, len = 140, angle = 0.45, col = color(255, 240, 200)) {
+    let dx = cos(angle) * len
+    let dy = sin(angle) * len
+    let tail = linear_gradient([alpha(col, 0), alpha(col, 0.8), col], x1: x, y1: y, x2: x + dx, y2: y + dy)
+    line(x, y, x + dx, y + dy, stroke: tail, width: 2, cap: "round")
+    let head = radial_gradient([col, alpha(col, 0)], cx: x, cy: y, r: 7)
+    circle(x, y, 7, fill: head)
 }
 
-// 程序化云
-fn clouds(count = 5, base_color = color(255, 255, 255), opacity = 0.5) {
+// 程序化积云：椭圆簇 + 高斯模糊，边缘真实柔和
+fn clouds(count = 5, base_col = color(255, 255, 255), opacity = 0.85, y_ratio = 0.45) {
     let w = width()
     let h = height()
-    material cloud_mat {
-        color: base_color
-        alpha: opacity
-        noise: 0.25
-    }
     for i in 0..count {
         let cx = rand(0, w)
-        let cy = rand(0, h * 0.5)
-        let blobs = rand(3, 7) as int
-        for j in 0..blobs {
-            let bx = cx + rand(-40, 40)
-            let by = cy + rand(-15, 15)
-            let br = rand(20, 50)
-            stroke {
-                path: circle(bx, by, br)
-                width: rand(20, 40)
-                material: cloud_mat
-            }
+        let cy = rand(h * 0.08, h * y_ratio)
+        let scale = rand(0.7, 1.6)
+        let shade = lerp_color(base_col, color(180, 190, 210), rand(0, 0.35))
+        group(translate: [cx, cy], blur: 7, opacity: opacity) {
+            ellipse(0, 0, 55 * scale, 22 * scale, fill: shade)
+            ellipse(-38 * scale, 6 * scale, 30 * scale, 15 * scale, fill: shade)
+            ellipse(40 * scale, 5 * scale, 34 * scale, 16 * scale, fill: shade)
+            ellipse(-14 * scale, -16 * scale, 32 * scale, 20 * scale, fill: lighten(shade, 0.12))
+            ellipse(18 * scale, -12 * scale, 28 * scale, 17 * scale, fill: lighten(shade, 0.08))
         }
     }
 }
 
-// 层云带
-fn cloud_band(y, band_height = 40, color = color(220, 220, 230), opacity = 0.4) {
+// 层云带：沿噪声曲线排布的模糊椭圆长带
+fn cloud_band(y, band_h = 46, col = color(222, 224, 235), opacity = 0.5) {
     let w = width()
-    material band_mat {
-        color: color
-        alpha: opacity
-        noise: 0.3
-    }
-    for x in 0..w step 25 {
-        let n = perlin(x * 0.005, y * 0.01)
-        let blob_r = 30 + n * 20
-        let blob_y = y + perlin(x * 0.01, 100) * band_height
-        stroke {
-            path: circle(x, blob_y, blob_r)
-            width: band_height * 0.6
-            material: band_mat
+    group(blur: 14, opacity: opacity) {
+        for x in 0..w step 40 {
+            let n = fbm(x * 0.004 + y * 0.01, 3.7, 3)
+            let by = y + n * band_h
+            let brx = 42 + fbm(x * 0.008, 9.1, 2) * 18
+            ellipse(x, by, brx, band_h * 0.5, fill: col)
         }
     }
 }
 
-// 极光
-fn aurora(bands = 3, color1 = color(80, 255, 180), color2 = color(180, 100, 255), intensity = 0.6) {
+// 极光：噪声驱动的发光缎带（渐变描边 + 模糊）
+fn aurora(bands = 3, col1 = color(80, 255, 180), col2 = color(170, 110, 255), intensity = 0.65) {
     let w = width()
-    let h = height()
     for i in 0..bands {
-        let base_y = h * 0.15 + i * 30
-        for x in 0..w step 30 {
-            let wave = perlin(x * 0.003, i * 0.5) * 80
-            let y = base_y + wave
-            let t = perlin(x * 0.008, i * 2)
-            let col = lerp_color(color1, color2, t)
-            let alpha = intensity * (0.3 + perlin(x * 0.01, i) * 0.4)
-            material aurora_mat {
-                color: col
-                alpha: alpha
-                noise: 0.1
-            }
-            stroke {
-                path: line(x, y, x + 30, y + perlin((x + 30) * 0.003, i * 0.5) * 80)
-                width: 15 + perlin(x * 0.005, i) * 10
-                material: aurora_mat
-            }
+        let base_y = height() * 0.12 + i * 34
+        let pts = []
+        for x in 0..w step 60 {
+            let wave = fbm(x * 0.003 + i * 0.7, 11.3, 3) * 70
+            push(pts, x)
+            push(pts, base_y + wave)
         }
+        let ribbon = linear_gradient([alpha(col2, 0), alpha(col2, 0.9), alpha(col1, 0)], y2: base_y + 130)
+        let cw = lerp_color(col1, col2, i / bands)
+        path(smooth(pts), stroke: ribbon, width: 26 + i * 10, cap: "round", blur: 10, opacity: intensity)
+        // 内芯亮线
+        path(smooth(pts), stroke: cw, width: 3, cap: "round", blur: 4, opacity: intensity * 0.8)
     }
 }
-
-// 雾层
-fn mist(y_start, color = color(200, 200, 200), intensity = 0.3) {
-    let w = width()
-    let h = height()
-    for y in y_start..h {
-        for x in 0..w {
-            let n = perlin(x * 0.01, y * 0.01) * 0.5 + 0.5
-            pixel(x: x, y: y, rgb: lerp_color((color[0], color[1], color[2]), brighten(color, 0.2), n))
-        }
-    }
-}
-
-} // end module Sky
