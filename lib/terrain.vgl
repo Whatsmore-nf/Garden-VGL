@@ -1,148 +1,98 @@
 // ============================================================
-// terrain.vgl — 语义化地形生成库
-// 山脉、地面、草坡、岩石、沙丘
-// 用法: import "lib/terrain.vgl"
-// v1.0: 默认参数 + color() + for 循环 + for step
+// terrain.vgl — 语义化地形矢量库
+// 山脊 / 层叠远山 / 沙丘 / 雪线
+// 用法: use "lib/terrain.vgl"
+// 山形由 fbm 噪声驱动，输出平滑多边形，可无限缩放
 // ============================================================
 
-module Terrain {
-
-// 单层山脊
-fn ridge(y_base, amplitude = 60, freq = 0.005, color = color(60, 50, 80), detail = 0.1) {
+// 单条山脊：fbm 起伏折线闭合到底部
+// off: 噪声偏移（不同 off 生成不同山形）
+fn ridge(y_base, amp = 70, freq = 0.006, col = color(70, 60, 95), off = 0, octaves = 4) {
     let w = width()
     let h = height()
-    for x in 0..w {
-        let n1 = perlin(x * freq, 0)
-        let n2 = perlin(x * freq * 3, 100) * 0.3
-        let n3 = perlin(x * freq * 8, 200) * detail
-        let height_val = y_base - (n1 + n2 + n3) * amplitude
-        for y in height_val..h {
-            let depth = (y - height_val) / (h - height_val)
-            pixel(x: x, y: y, rgb: lerp_color(color, darken(color, 0.3), depth * 0.5))
-        }
+    let pts = []
+    for x in 0..w + 20 step 14 {
+        let n = fbm(x * freq + off, off * 0.7, octaves)
+        push(pts, x)
+        push(pts, y_base + n * amp)
+    }
+    // 闭合到画布底部
+    push(pts, w + 20)
+    push(pts, h + 4)
+    push(pts, -20)
+    push(pts, h + 4)
+    polygon(pts, fill: col, stroke: none)
+    // 山脊亮边（受光）
+    let ridge_pts = []
+    for x in 0..w + 20 step 14 {
+        let n = fbm(x * freq + off, off * 0.7, octaves)
+        push(ridge_pts, x)
+        push(ridge_pts, y_base + n * amp)
+    }
+    path(smooth(ridge_pts), stroke: lighten(col, 0.3), width: 1.5, opacity: 0.6)
+}
+
+// 层叠远山：多条山脊由浅入深，营造大气透视
+fn mountains(layers = 4, y_base = height() * 0.62, far = color(150, 140, 175), near = color(35, 28, 55), amp = 80) {
+    let n = max(layers, 2)
+    for i in 0..n {
+        let t = i / (n - 1)
+        let col = lerp_color(far, near, t)
+        let y = y_base - amp * 0.9 + t * amp * 0.75
+        ridge(y, amp * (0.5 + t * 0.5), 0.005 + t * 0.003, col, 100 + i * 37.7, 4)
     }
 }
 
-// 多层山脉
-fn mountains(layers = 3, palette, base_y, spacing = 30) {
-    for i in 0..layers {
-        let color = palette[i % len(palette)]
-        let y_base = base_y - i * spacing
-        let amp = 60 + i * 20
-        let freq = 0.003 + i * 0.002
-        let detail = 0.15 - i * 0.02
-        let atm_color = lerp_color(color, color(200, 220, 240), 0.3 - i * 0.05)
-        ridge(y_base, amp, freq, atm_color, detail)
+// 雪线：在山脊上方叠一条白色覆盖
+fn snow_cap(y_base, amp = 70, freq = 0.006, col = color(245, 248, 255), off = 0, depth = 26, octaves = 4) {
+    let w = width()
+    let pts = []
+    for x in 0..w + 20 step 14 {
+        let n = fbm(x * freq + off, off * 0.7, octaves)
+        let ny = y_base + n * amp
+        // 雪面下缘参差
+        let drift = fbm(x * 0.02 + off, 55.5, 2) * 8
+        push(pts, x)
+        push(pts, ny + depth + drift)
     }
+    // 闭合回山脊表面（沿脊线上方）
+    let back = []
+    for x in 0..w + 20 step 14 {
+        let n = fbm((w + 20 - x) * freq + off, off * 0.7, octaves)
+        push(back, w + 20 - x)
+        push(back, y_base + n * amp - 2)
+    }
+    let all = []
+    for i in 0..len(pts) {
+        push(all, pts[i])
+    }
+    for i in 0..len(back) {
+        push(all, back[i])
+    }
+    polygon(all, fill: col, stroke: none, opacity: 0.95)
 }
 
-// 平坦地面
-fn ground(y_base, color = color(60, 50, 40), noise_amount = 0.15) {
+// 沙丘：低频正弦 + 噪声的柔和起伏
+fn dunes(y_base, amp = 40, col = color(222, 184, 130), off = 0) {
     let w = width()
     let h = height()
-    for y in y_base..h {
-        let depth = (y - y_base) / (h - y_base)
-        let base_col = lerp_color(color, darken(color, 0.4), depth)
-        for x in 0..w {
-            let n = perlin(x * 0.02, y * 0.02) * noise_amount
-            pixel(x: x, y: y, rgb: lerp_color(base_col, brighten(base_col, 0.2), n * 0.5 + 0.5))
-        }
+    let pts = []
+    for x in 0..w + 20 step 18 {
+        let dune = sin(x * 0.004 + off) * 0.6 + fbm(x * 0.003 + off, 7.7, 2) * 0.4
+        push(pts, x)
+        push(pts, y_base + dune * amp)
     }
+    push(pts, w + 20)
+    push(pts, h + 4)
+    push(pts, -20)
+    push(pts, h + 4)
+    polygon(pts, fill: col, stroke: none)
+    // 背光面阴影
+    let shade = []
+    for x in 0..w + 20 step 18 {
+        let dune = sin(x * 0.004 + off) * 0.6 + fbm(x * 0.003 + off, 7.7, 2) * 0.4
+        push(shade, x)
+        push(shade, y_base + dune * amp + 10)
+    }
+    path(smooth(shade), stroke: darken(col, 0.25), width: 5, opacity: 0.5, blur: 3)
 }
-
-// 起伏地形
-fn rolling(y_base, amplitude = 30, freq = 0.01, color = color(60, 50, 40), noise_amount = 0.1) {
-    let w = width()
-    let h = height()
-    for x in 0..w {
-        let n = perlin(x * freq, 0) * amplitude + perlin(x * freq * 4, 50) * amplitude * 0.3
-        let surface = y_base + n
-        for y in surface..h {
-            let depth = (y - surface) / (h - surface)
-            let n2 = perlin(x * 0.03, y * 0.02) * noise_amount
-            let base_col = lerp_color(color, darken(color, 0.4), depth)
-            pixel(x: x, y: y, rgb: lerp_color(base_col, brighten(base_col, 0.15), n2 * 0.5 + 0.5))
-        }
-    }
-}
-
-// 草地纹理
-fn grass_texture(y_base, color1 = color(50, 80, 30), color2 = color(90, 120, 50), density = 1.0) {
-    let w = width()
-    let h = height()
-    for y in y_base..h {
-        let depth = (y - y_base) / (h - y_base)
-        for x in 0..w {
-            let n = fbm(x * 0.02 * density, y * 0.02 * density, 4)
-            let col = lerp_color(color1, color2, n * 0.5 + 0.5)
-            pixel(x: x, y: y, rgb: lerp_color(col, darken(col, 0.3), depth * 0.5))
-        }
-    }
-}
-
-// 草丛
-fn grass_blades(x, y, count = 20, base_color = color(50, 80, 30), max_height = 12) {
-    for i in 0..count {
-        let bx = x + rand(-30, 30)
-        let by = y + rand(-5, 5)
-        let h = rand(3, max_height)
-        let sway = rand(-3, 3)
-        let col = lerp_color(base_color, brighten(base_color, 0.2), rand(0, 1))
-        stroke {
-            path: line(bx, by, bx + sway, by - h)
-            width: rand(0.5, 1.5)
-            color: col
-        }
-    }
-}
-
-// 岩石
-fn rock(x, y, size = 15, color = color(80, 70, 60)) {
-    material rock_mat {
-        color: color
-        alpha: 1.0
-        noise: 0.4
-    }
-    let sides = rand(5, 8) as int
-    let pts = array()
-    for i in 0..sides {
-        let angle = (i / sides) * 6.28318
-        let r = size * (0.7 + perlin(i * 1.7, 0) * 0.3)
-        push(pts, (x + cos(angle) * r, y + sin(angle) * r))
-    }
-    fill_polygon(pts, color)
-    stroke {
-        path: polygon(pts)
-        width: 1
-        material: rock_mat
-    }
-}
-
-// 砾石地
-fn gravel(y_base, count = 50, color = color(80, 70, 60)) {
-    let w = width()
-    let h = height()
-    for i in 0..count {
-        let x = rand(0, w)
-        let y = y_base + rand(0, h - y_base)
-        let s = rand(2, 8)
-        let shade = rand(0.7, 1.1)
-        fill_circle(x, y, s, (color[0] * shade, color[1] * shade, color[2] * shade))
-    }
-}
-
-// 沙丘
-fn dunes(y_base, amplitude = 30, freq = 0.005, color1 = color(200, 180, 120), color2 = color(160, 130, 80)) {
-    let w = width()
-    let h = height()
-    for x in 0..w {
-        let n = perlin(x * freq, 0) * amplitude
-        let surface = y_base + n
-        for y in surface..h {
-            let depth = (y - surface) / (h - surface)
-            pixel(x: x, y: y, rgb: lerp_color(color1, color2, depth))
-        }
-    }
-}
-
-} // end module Terrain

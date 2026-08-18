@@ -1,302 +1,238 @@
 // ============================================================
-// 词法分析
+// VGL v2.0 — 词法分析器
 // ============================================================
 
 use crate::error::{VglError, VglResult};
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Token {
-    Number(f64),
-    String(String),
-    Color(u8, u8, u8, u8), // v0.9: 8 位 hex 支持 alpha 通道
+pub enum Tok {
     Ident(String),
-    Keyword(String),
-    LParen,
-    RParen,
-    LBrace,
-    RBrace,
-    LBracket,
-    RBracket,
-    Comma,
-    Colon,
-    Dot,
-    DotDot,
-    Op(String),
+    Num(f64),
+    Str(String),
+    Kw(&'static str),
+    Punct(&'static str),
     Eof,
 }
 
-#[derive(Debug, Clone)]
-pub struct TokenWithPos {
-    pub tok: Token,
-    pub pos: usize,
+const KEYWORDS: &[&str] = &[
+    "let", "fn", "if", "else", "for", "in", "while",
+    "return", "break", "continue", "use", "canvas", "seed",
+    "render", "true", "false", "none",
+];
+
+pub struct Lexer<'a> {
+    src: &'a str,
+    chars: Vec<(usize, char)>,
+    idx: usize,
 }
 
-pub struct Lexer {
-    pub chars: Vec<char>,
-    pub pos: usize,
-}
+impl<'a> Lexer<'a> {
+    pub fn new(src: &'a str) -> Self {
+        Lexer { src, chars: src.char_indices().collect(), idx: 0 }
+    }
 
-impl Lexer {
-    pub fn new(s: &str) -> Self {
-        Lexer {
-            chars: s.chars().collect(),
-            pos: 0,
-        }
+    fn peek(&self) -> Option<(usize, char)> {
+        self.chars.get(self.idx).copied()
     }
-    pub fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+
+    fn peek_at(&self, off: usize) -> Option<(usize, char)> {
+        self.chars.get(self.idx + off).copied()
     }
-    pub fn advance(&mut self) -> Option<char> {
+
+    fn bump(&mut self) -> Option<(usize, char)> {
         let c = self.peek();
-        self.pos += 1;
+        if c.is_some() {
+            self.idx += 1;
+        }
         c
     }
-    pub fn skip_ws(&mut self) {
-        while let Some(c) = self.peek() {
-            if !c.is_whitespace() {
-                break;
+
+    pub fn tokenize(mut self) -> VglResult<Vec<(Tok, usize)>> {
+        let mut out = Vec::new();
+        loop {
+            let (pos, ch) = match self.peek() {
+                Some(c) => c,
+                None => {
+                    out.push((Tok::Eof, self.src.len()));
+                    break;
+                }
+            };
+            match ch {
+                c if c.is_whitespace() => {
+                    self.bump();
+                }
+                '/' if matches!(self.peek_at(1), Some((_, '/'))) => {
+                    while let Some((_, c)) = self.peek() {
+                        if c == '\n' {
+                            break;
+                        }
+                        self.bump();
+                    }
+                }
+                '/' if matches!(self.peek_at(1), Some((_, '*'))) => {
+                    self.bump();
+                    self.bump();
+                    let mut closed = false;
+                    while let Some((_, c)) = self.bump() {
+                        if c == '*' && matches!(self.peek(), Some((_, '/'))) {
+                            self.bump();
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if !closed {
+                        return Err(VglError::new("未闭合的块注释 /*", pos));
+                    }
+                }
+                '0'..='9' => {
+                    let num = self.read_number()?;
+                    // 尺寸字面量: 800x600 → Num(800) Ident("x") Num(600)
+                    if let Some((_, 'x' | 'X')) = self.peek() {
+                        if matches!(self.peek_at(1), Some((_, '0'..='9'))) {
+                            self.bump();
+                            let h = self.read_number()?;
+                            out.push((num.0, pos));
+                            out.push((Tok::Ident("x".to_string()), pos));
+                            let hp = self.peek().map(|(p, _)| p).unwrap_or(pos);
+                            out.push((h.0, hp));
+                            continue;
+                        }
+                    }
+                    out.push(num);
+                }
+                '"' => {
+                    let s = self.read_string(pos)?;
+                    out.push((Tok::Str(s), pos));
+                }
+                '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':' | ';' | '+' | '-' | '*' | '/'
+                | '%' | '<' | '>' | '=' | '!' | '.' => {
+                    let tok = self.read_punct()?;
+                    out.push((tok, pos));
+                }
+                c if c.is_alphabetic() || c == '_' => {
+                    let mut s = String::new();
+                    while let Some((_, c)) = self.peek() {
+                        if c.is_alphanumeric() || c == '_' {
+                            s.push(c);
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                    let kw = KEYWORDS.iter().find(|k| **k == s);
+                    out.push((match kw {
+                        Some(k) => Tok::Kw(k),
+                        None => Tok::Ident(s),
+                    }, pos));
+                }
+                other => {
+                    return Err(VglError::new(
+                        format!("非法字符 '{}'", other),
+                        pos,
+                    ));
+                }
             }
-            self.advance();
         }
+        Ok(out)
     }
-    pub fn read_number(&mut self) -> VglResult<f64> {
-        let start = self.pos;
-        while let Some(c) = self.peek() {
+
+    fn read_number(&mut self) -> VglResult<(Tok, usize)> {
+        let pos = self.peek().map(|(p, _)| p).unwrap_or(0);
+        let mut s = String::new();
+        while let Some((_, c)) = self.peek() {
             if c.is_ascii_digit() {
-                self.advance();
+                s.push(c);
+                self.bump();
             } else {
                 break;
             }
         }
-        if let Some('.') = self.peek() {
-            if self.pos + 1 >= self.chars.len() || self.chars[self.pos + 1] != '.' {
-                self.advance();
-                while let Some(c) = self.peek() {
+        if let Some((_, '.')) = self.peek() {
+            if matches!(self.peek_at(1), Some((_, '0'..='9'))) {
+                s.push('.');
+                self.bump();
+                while let Some((_, c)) = self.peek() {
                     if c.is_ascii_digit() {
-                        self.advance();
+                        s.push(c);
+                        self.bump();
                     } else {
                         break;
                     }
                 }
             }
         }
-        let s: String = self.chars[start..self.pos].iter().collect();
-        s.parse::<f64>()
-            .map_err(|_| VglError::new(format!("非法数字 {}", s), Some(start)))
+        let v: f64 = s
+            .parse()
+            .map_err(|_| VglError::new(format!("非法数字 '{}'", s), pos))?;
+        Ok((Tok::Num(v), pos))
     }
-    pub fn read_ident(&mut self) -> String {
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        self.chars[start..self.pos].iter().collect()
-    }
-    pub fn read_string(&mut self) -> VglResult<String> {
-        let start_pos = self.pos;
-        self.advance(); // 跳过开头 "
-        let mut result = String::new();
-        while let Some(c) = self.peek() {
-            if c == '"' {
-                self.advance();
-                return Ok(result);
-            }
-            if c == '\\' {
-                self.advance();
-                if let Some(nxt) = self.peek() {
-                    match nxt {
-                        'n' => result.push('\n'),
-                        't' => result.push('\t'),
-                        'r' => result.push('\r'),
-                        '\\' => result.push('\\'),
-                        '"' => result.push('"'),
-                        '0' => result.push('\0'),
-                        _ => {
-                            result.push('\\');
-                            result.push(nxt);
-                        }
-                    }
-                    self.advance();
-                }
-                continue;
-            }
-            result.push(c);
-            self.advance();
-        }
-        // EOF 仍未闭合
-        Err(VglError::new("未终止的字符串", Some(start_pos)))
-    }
-    pub fn read_color(&mut self) -> VglResult<(u8, u8, u8, u8)> {
-        // v0.9: 返回 (r, g, b, a)，支持 #RGB / #RRGGBB / #RGBA / #RRGGBBAA
-        let start_pos = self.pos;
-        self.advance(); // 跳过 #
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_hexdigit() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        let hex: String = self.chars[start..self.pos].iter().collect();
-        if hex.len() == 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).unwrap();
-            let g = u8::from_str_radix(&hex[2..4], 16).unwrap();
-            let b = u8::from_str_radix(&hex[4..6], 16).unwrap();
-            Ok((r, g, b, 255))
-        } else if hex.len() == 8 {
-            // v0.9: #RRGGBBAA 8 位 hex 支持 alpha 通道
-            let r = u8::from_str_radix(&hex[0..2], 16).unwrap();
-            let g = u8::from_str_radix(&hex[2..4], 16).unwrap();
-            let b = u8::from_str_radix(&hex[4..6], 16).unwrap();
-            let a = u8::from_str_radix(&hex[6..8], 16).unwrap();
-            Ok((r, g, b, a))
-        } else if hex.len() == 3 {
-            let r = u8::from_str_radix(&format!("{}{}", &hex[0..1], &hex[0..1]), 16).unwrap();
-            let g = u8::from_str_radix(&format!("{}{}", &hex[1..2], &hex[1..2]), 16).unwrap();
-            let b = u8::from_str_radix(&format!("{}{}", &hex[2..3], &hex[2..3]), 16).unwrap();
-            Ok((r, g, b, 255))
-        } else if hex.len() == 4 {
-            // v0.9: #RGBA 4 位 hex 支持 alpha 通道
-            let r = u8::from_str_radix(&format!("{}{}", &hex[0..1], &hex[0..1]), 16).unwrap();
-            let g = u8::from_str_radix(&format!("{}{}", &hex[1..2], &hex[1..2]), 16).unwrap();
-            let b = u8::from_str_radix(&format!("{}{}", &hex[2..3], &hex[2..3]), 16).unwrap();
-            let a = u8::from_str_radix(&format!("{}{}", &hex[3..4], &hex[3..4]), 16).unwrap();
-            Ok((r, g, b, a))
-        } else {
-            Err(VglError::new(format!("非法颜色 #{}", hex), Some(start_pos)))
-        }
-    }
-    pub fn next_token(&mut self) -> VglResult<TokenWithPos> {
+
+    fn read_string(&mut self, start: usize) -> VglResult<String> {
+        self.bump(); // 开头 "
+        let mut s = String::new();
         loop {
-            self.skip_ws();
-            let c = match self.peek() {
-                None => return Ok(TokenWithPos { tok: Token::Eof, pos: self.pos }),
-                Some(ch) => ch,
-            };
-            if c == '/' && self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '/' {
-                self.pos += 2;
-                while let Some(ch) = self.peek() {
-                    if ch == '\n' {
-                        self.advance();
-                        break;
+            match self.bump() {
+                Some((_, '"')) => return Ok(s),
+                Some((_, '\\')) => match self.bump() {
+                    Some((_, 'n')) => s.push('\n'),
+                    Some((_, 't')) => s.push('\t'),
+                    Some((_, '"')) => s.push('"'),
+                    Some((_, '\\')) => s.push('\\'),
+                    Some((p, c)) => {
+                        return Err(VglError::new(format!("非法转义 \\{}", c), p));
                     }
-                    self.advance();
+                    None => return Err(VglError::new("未闭合的字符串", start)),
+                },
+                Some((_, '\n')) | None => {
+                    return Err(VglError::new("未闭合的字符串", start));
                 }
-                continue;
-            }
-            if c == '/' && self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '*' {
-                let block_start = self.pos;
-                self.pos += 2;
-                loop {
-                    match self.peek() {
-                        None => return Err(VglError::new("未闭合的块注释", Some(block_start))),
-                        Some('*') if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '/' => {
-                            self.pos += 2;
-                            break;
-                        }
-                        _ => {
-                            self.advance();
-                        }
-                    }
-                }
-                continue;
-            }
-            break;
-        }
-        let tok_pos = self.pos;
-        let c = match self.peek() {
-            None => return Ok(TokenWithPos { tok: Token::Eof, pos: self.pos }),
-            Some(ch) => ch,
-        };
-        if c == '.' && self.pos + 1 < self.chars.len() {
-            if self.chars[self.pos + 1] == '.' {
-                self.advance();
-                self.advance();
-                return Ok(TokenWithPos { tok: Token::DotDot, pos: tok_pos });
-            }
-            if self.chars[self.pos + 1].is_ascii_digit() {
-                return Ok(TokenWithPos { tok: Token::Number(self.read_number()?), pos: tok_pos });
+                Some((_, c)) => s.push(c),
             }
         }
-        if c.is_ascii_digit() {
-            return Ok(TokenWithPos { tok: Token::Number(self.read_number()?), pos: tok_pos });
-        }
-        if c == '"' {
-            return Ok(TokenWithPos { tok: Token::String(self.read_string()?), pos: tok_pos });
-        }
-        if c == '#' {
-            let (r, g, b, a) = self.read_color()?;
-            return Ok(TokenWithPos { tok: Token::Color(r, g, b, a), pos: tok_pos });
-        }
-        if c.is_alphabetic() || c == '_' {
-            let ident = self.read_ident();
-            let kw = [
-                "canvas", "bg", "let", "for", "in", "if", "else", "fn", "return", "pixel",
-                "stroke", "render", "while", "break", "and", "or", "not", "seed", "true",
-                "false", "continue", "struct", "import", "material", "layer", "field",
-                "null", "const", "var", // v0.9: null 字面量 + const/var 绑定
-                "as", "match", "case", "default", "enum", "class", "from", "module", // v0.9: as/match/enum/class/module 关键字
-                "step", // v1.0: for step 关键字
-            ];
-            if kw.contains(&ident.as_str()) {
-                return Ok(TokenWithPos { tok: Token::Keyword(ident), pos: tok_pos });
-            }
-            return Ok(TokenWithPos { tok: Token::Ident(ident), pos: tok_pos });
-        }
-        let tok = match c {
-            '(' => { self.advance(); Token::LParen }
-            ')' => { self.advance(); Token::RParen }
-            '{' => { self.advance(); Token::LBrace }
-            '}' => { self.advance(); Token::RBrace }
-            '[' => { self.advance(); Token::LBracket }
-            ']' => { self.advance(); Token::RBracket }
-            ',' => { self.advance(); Token::Comma }
-            ':' => { self.advance(); Token::Colon }
-            '.' => { self.advance(); Token::Dot }
-            // v0.8: 添加 % 单字符运算符；扩展双字符识别以支持复合赋值 += -= *= /= %=
-            // v0.9: 新增位运算符 & | ^ ~ 与移位 << >>、自增自减 ++ --
-            '+' | '-' | '*' | '/' | '=' | '<' | '>' | '!' | '%' | '&' | '|' | '^' | '~' => {
-                self.advance();
-                let mut op = c.to_string();
-                if let Some(nxt) = self.peek() {
-                    // v0.9: 双字符运算符 << >> ++ -- => （移位/自增自减/match 箭头，优先于 = 检测）
-                    let two_char = match (c, nxt) {
-                        ('<', '<') => Some("<<"),
-                        ('>', '>') => Some(">>"),
-                        ('+', '+') => Some("++"),
-                        ('-', '-') => Some("--"),
-                        ('=', '>') => Some("=>"),
-                        _ => None,
-                    };
-                    if let Some(tw) = two_char {
-                        self.advance();
-                        op = tw.to_string();
-                    } else if nxt == '=' && matches!(c, '<' | '>' | '=' | '!' | '+' | '-' | '*' | '/' | '%') {
-                        // 双字符运算符：==, !=, <=, >= 以及复合赋值 +=, -=, *=, /=, %=
-                        self.advance();
-                        op.push('=');
-                    }
-                }
-                Token::Op(op)
-            }
-            _ => return Err(VglError::new(format!("非法字符 '{}'", c), Some(tok_pos))),
-        };
-        Ok(TokenWithPos { tok, pos: tok_pos })
     }
-    pub fn tokenize(&mut self) -> VglResult<Vec<TokenWithPos>> {
-        let mut toks = Vec::new();
-        loop {
-            let t = self.next_token()?;
-            let is_eof = matches!(t.tok, Token::Eof);
-            toks.push(t);
-            if is_eof {
-                break;
+
+    fn read_punct(&mut self) -> VglResult<Tok> {
+        let (pos, c) = self.peek().unwrap();
+        let two: &[&str] = &["..", "==", "!=", "<=", ">="];
+        if c == '.' || c == '=' || c == '!' || c == '<' || c == '>' {
+            if let Some((_, c2)) = self.peek_at(1) {
+                let pair: String = [c, c2].iter().collect();
+                if two.contains(&pair.as_str()) {
+                    self.bump();
+                    self.bump();
+                    return Ok(Tok::Punct(match pair.as_str() {
+                        ".." => "..",
+                        "==" => "==",
+                        "!=" => "!=",
+                        "<=" => "<=",
+                        _ => ">=",
+                    }));
+                }
             }
         }
-        Ok(toks)
+        self.bump();
+        let p = match c {
+            '(' => "(",
+            ')' => ")",
+            '[' => "[",
+            ']' => "]",
+            '{' => "{",
+            '}' => "}",
+            ',' => ",",
+            ':' => ":",
+            ';' => ";",
+            '+' => "+",
+            '-' => "-",
+            '*' => "*",
+            '/' => "/",
+            '%' => "%",
+            '<' => "<",
+            '>' => ">",
+            '=' => "=",
+            '!' => "!",
+            _ => unreachable!(),
+        };
+        let _ = pos;
+        Ok(Tok::Punct(p))
     }
 }

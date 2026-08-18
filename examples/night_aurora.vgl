@@ -1,0 +1,45 @@
+// ============================================================
+// night_aurora.vgl — 极光雪夜
+// 演示: stars / moon / meteor / aurora / cloud_band
+//       conifer 森林 / snow / vignette
+// 运行: vgl examples/night_aurora.vgl
+// ============================================================
+
+use "../lib/palette.vgl"
+use "../lib/sky.vgl"
+use "../lib/terrain.vgl"
+use "../lib/vegetation.vgl"
+use "../lib/atmosphere.vgl"
+
+canvas 1000x700
+seed 23
+
+// 夜色天空
+let cols = palette("night")
+sky(cols[0], cols[1])
+
+// 星空与流星
+stars(180, 0.8, 0.95)
+meteor(770, 90, 150, 0.5)
+meteor(220, 60, 110, 0.35)
+
+// 极光缎带
+aurora(4, color(90, 255, 190), color(160, 110, 255), 0.6)
+
+// 月亮
+moon(160, 130, 30)
+
+// 远山剪影 + 雪原
+mountains(3, 460, color(60, 72, 110), color(18, 24, 44), 70)
+let snow_grad = linear_gradient([color(225, 232, 250), color(150, 165, 200)])
+rect(0, 470, 1000, 230, fill: snow_grad, stroke: none)
+
+// 针叶林（近景深色压住雪原）
+forest(16, 500, 620, 1, color(20, 40, 44))
+
+// 高空薄云带 + 落雪 + 暗角
+cloud_band(180, 40, color(150, 160, 210), 0.25)
+snow(110)
+vignette(0.5, color(6, 8, 20))
+
+render "night_aurora.svg"

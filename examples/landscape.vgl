@@ -1,0 +1,46 @@
+// ============================================================
+// landscape.vgl — 黄昏山水湖景
+// 演示: palette / sky / sun / mountains / snow_cap
+//       water / waves / shimmer / forest / ground_fog / vignette
+// 运行: vgl examples/landscape.vgl
+// ============================================================
+
+use "../lib/palette.vgl"
+use "../lib/sky.vgl"
+use "../lib/terrain.vgl"
+use "../lib/water.vgl"
+use "../lib/vegetation.vgl"
+use "../lib/atmosphere.vgl"
+
+canvas 1000x700
+seed 7
+
+// 调色板驱动的黄昏天空
+let cols = palette("dusk")
+sky(cols[0], cols[1])
+
+// 太阳低垂，接近山线
+sun(500, 430, 46, cols[2])
+
+// 层叠远山（浅紫 → 深黛）
+mountains(4, 470, lerp_color(cols[0], color(180, 140, 170), 0.55), color(30, 22, 48), 90)
+
+// 最近一道山脊加雪线
+ridge(505, 60, 0.005, color(44, 34, 66), 217.3, 4)
+snow_cap(505, 60, 0.005, color(235, 225, 240), 217.3, 20, 4)
+
+// 湖面 + 波纹 + 日光倒影
+water(530, color(150, 130, 160), color(24, 20, 44))
+waves(530, 6, 120, 4, color(255, 220, 190))
+shimmer(500, 530, 120, cols[2])
+
+// 岸边森林（近景偏暗）
+forest(18, 560, 640, 1, color(30, 40, 44))
+grass(648, 60, color(60, 70, 66), 14)
+
+// 大气：贴地雾 + 暖色罩 + 暗角
+ground_fog(520, color(220, 180, 170), 0.35)
+tint(cols[2], 0.08)
+vignette(0.4)
+
+render "landscape.svg"

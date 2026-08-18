@@ -1,52 +1,40 @@
-<h1 align="center">🍃 VGL (Visual Graphics Language)</h1>
+<h1 align="center">🍃 VGL v2.0 (Visual Graphics Language)</h1>
 
 <p align="center">
-  <em>A language for AI to understand and procedurally edit.</em><br>
-  <em>为 AI 理解和程序化编辑而生的图像生成语言。</em><br>
-  <em>代码是"活的生成蓝图"，而非"死的像素快照"。</em>
-</p>
-
-<p align="center">
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="docs/VGL-快速入门.md">快速入门</a> ·
-  <a href="docs/VGL-Quick-Reference.md">Language Reference</a> ·
-  <a href="docs/VGL_语法规范%20v0.5.txt">语法规范</a> ·
-  <a href="examples">Examples</a>
+  <em>A procedural language that generates SVG — for AI and humans to read, write, and edit.</em><br>
+  <em>过程式矢量图形语言：输出 SVG，为 AI 与人类的阅读、生成、修改而生。</em><br>
+  <em>代码是"活的生成蓝图"，输出是无限精度的矢量。</em>
 </p>
 
 ---
 
-VGL is a **procedural image generation language designed for AI understanding and semantic editing**. Instead of stacking meaningless pixel coordinates, VGL uses functions, variables, materials, and fields to create **living generation blueprints** — code that describes *how* to generate an image, not *what* each pixel is.
+VGL 是一门**输出 SVG 的过程式图形语言**。它不堆像素坐标，而是用变量、函数、循环和噪声描述"如何生成"一张图：
 
-VGL 是一个**为 AI 理解和程序化编辑而生的程序化图像生成语言**。VGL 不堆砌无意义的像素坐标，而是用函数、变量、材质和场来创建**活的生成蓝图**——代码描述的是"如何生成"图像，而非"每个像素是什么"。
+- **矢量原生** — 输出即 SVG（渐变、路径、滤镜、变换），浏览器直接打开，Figma/Illustrator 直接编辑，放大到任意尺寸不失真
+- **确定性生成** — `seed 42` 永远得到同一张图；改一个变量、换一个种子，整幅场景随之重生
+- **AI 友好** — 语法精简（~20 个关键字），语义库命名直白（`mountains`、`fog`、`aurora`），AI 读代码即懂画面
+- **零依赖单二进制** — 纯 Rust，无外部库，`cargo build` 即可
 
 ```vgl
-import "lib/palette.vgl"
-import "lib/sky.vgl"
-import "lib/terrain.vgl"
+use "../lib/palette.vgl"
+use "../lib/sky.vgl"
+use "../lib/terrain.vgl"
+use "../lib/water.vgl"
+use "../lib/atmosphere.vgl"
 
-from Sky import gradient, sun, clouds
-from Terrain import mountains, ground
+canvas 1000x700
+seed 7
 
-canvas 800x600
-seed 42
+let cols = palette("dusk")           // 语义调色板
+sky(cols[0], cols[1])                // 黄昏渐变天空
+sun(500, 430, 46, cols[2])           // 低垂的太阳
+mountains(4, 470, color(90, 70, 100), color(30, 22, 48), 90)  // 层叠远山
+water(530)                           // 湖面
+shimmer(500, 530, 120, cols[2])      // 日光倒影
+ground_fog(520)                      // 贴地雾
+vignette(0.4)                        // 暗角
 
-// 调色板：语义化变量 + v1.0 color() 构造器，一目了然
-let sky_top = color(30, 20, 60)
-let sky_horizon = color(255, 180, 100)
-let mountain_far = color(60, 50, 80)
-let ground_col = color(40, 35, 50)
-let sun_color = color(255, 220, 150)
-
-// 生成蓝图：调用语义化函数（v1.0 命名参数，一看即懂）
-gradient(sky_top, sky_horizon)
-sun(500, 100, color: sun_color)
-clouds(count: 5, base_color: color(255, 240, 200), opacity: 0.4)
-mountains(3, [mountain_far, color(45, 40, 65), color(30, 25, 45)], 380, spacing: 40)
-ground(390, color: ground_col, noise_amount: 0.2)
-
-vignette(0.35, 0.7)
-render "sunset.png"
+render "landscape.svg"
 ```
 
 ---
@@ -55,158 +43,130 @@ render "sunset.png"
 
 | Category · 分类 | Capabilities · 能力 |
 |----------|-------------|
-| **Drawing · 绘制** | pixel, stroke (AA lines/circles/beziers), fill (rect/circle/ellipse/polygon/flood), gradient (linear/radial), text (5×7 dot matrix) |
-| **Transform & Clip · 变换与裁剪** | translate/rotate/scale, push/pop transform stack, clip rect with intersection stack |
-| **Materials & Layers · 材质与图层** | material definitions with noise perturbation, off-screen layer compositing (12 blend modes), color fields |
-| **Data Types · 数据类型** | number, bool, string, color (with alpha), tuple, array, dict, struct, enum, class, path |
-| **Control Flow · 控制流** | if/else-if/else, while, for range, for-in array, labeled break/continue, match/case pattern matching |
-| **Functions · 函数** | first-class functions, closures with mutable capture, recursion |
-| **OOP & Modules · 面向对象与模块** | class inheritance, method override, module namespaces, from...import |
-| **Semantic Library · 语义化标准库** | `lib/` — Palette (gradients, presets), Sky (gradient/sun/stars/clouds/aurora), Terrain (mountains/ground/grass/rocks/dunes), Water (surface/ripples/reflection/waterfall), Vegetation (trees/bushes/flowers/forest), Atmosphere (fog/god_rays/snow/rain/fireflies) |
-| **Standard Library · 标准库** | math (trig/log/exp/clamp/lerp), noise (perlin/worley/fbm), color conversion, post-processing (blur/sharpen/grain/vignette), string utilities |
-| **AI-Ready · AI 友好** | Semantic replicate mode: image→code with K-means palette extraction + structure analysis (2800x smaller than progressive mode) |
-| **Quality · 质量** | SDF anti-aliasing, premultiplied alpha, sub-pixel scanlines, sRGB linear workflow, miter/bevel/round stroke joins |
+| **Shapes · 形状** | `rect` `circle` `ellipse` `line` `polygon` `polyline` `path` `text`（真 SVG 文本） |
+| **Paint · 填充** | `color(r,g,b,a)` / `#hex` / `linear_gradient` / `radial_gradient`，任意形状可填充渐变 |
+| **Effects · 效果** | `blur:`（高斯模糊滤镜）、`opacity:`、`smooth()`（Catmull-Rom 平滑路径） |
+| **Transform · 变换** | `group(translate:, rotate:, scale:)` 嵌套变换组 |
+| **Procedural · 过程式** | `fn`（默认参数）、`for i in a..b step s`、`while`、`if/else`、数组、`return` |
+| **Noise · 噪声** | 确定性 `rand` / `rand_int` / `perlin` / `fbm`（同一 seed 完全可复现） |
+| **Semantic Library · 语义库** | `lib/` 六个模块 30+ 场景原语（见下表） |
+
+### 语义库 lib/
+
+| Module | Primitives |
+|--------|-----------|
+| `palette.vgl` | `palette("dusk"/"night"/...)` `palette_sky` `palette_pick` |
+| `sky.vgl` | `sky` `sun` `moon` `stars` `meteor` `clouds` `cloud_band` `aurora` |
+| `terrain.vgl` | `ridge` `mountains` `snow_cap` `dunes` |
+| `water.vgl` | `water` `waves` `shimmer` |
+| `vegetation.vgl` | `tree` `broadleaf` `conifer` `forest` `grass` |
+| `atmosphere.vgl` | `fog` `ground_fog` `rain` `snow` `light_rays` `vignette` `tint` |
 
 ---
 
 ## Quick Start · 快速上手
 
-### Install · 安装
-
 ```bash
 git clone https://github.com/Whatsmore-nf/Garden-VGL.git
 cd Garden-VGL
 cargo build --release
+
+./target/release/vgl examples/landscape.vgl   # → examples/landscape.svg
 ```
 
-The single binary `target/release/vgl.exe` (or `vgl` on Linux/macOS) is ready to use.
+浏览器打开生成的 SVG 即可查看。
 
-编译后得到单文件 `target/release/vgl.exe`（或 Linux/macOS 下的 `vgl`），可直接使用。
-
-### Your First Image · 第一张图
-
-Create `sunset.vgl` / 创建 `sunset.vgl`：
+### 三行起步
 
 ```vgl
-import "lib/sky.vgl"
-import "lib/terrain.vgl"
-
-from Sky import gradient, sun, clouds
-from Terrain import mountains, ground
-
-canvas 800x600
-seed 42
-
-let sky_top = color(30, 20, 60)
-let sky_horizon = color(255, 180, 100)
-let mountain_col = color(45, 40, 65)
-let ground_col = color(40, 35, 50)
-
-gradient(sky_top, sky_horizon)
-sun(400, 100, color: color(255, 220, 150))
-clouds(count: 5, base_color: color(255, 240, 200), opacity: 0.4)
-mountains(2, [mountain_col, color(30, 25, 45)], 380, spacing: 40)
-ground(390, color: ground_col, noise_amount: 0.2)
-
-render "sunset.png"
+canvas 400x300
+circle(200, 150, 80, fill: linear_gradient([color(255,107,107), color(78,205,196)]))
+render "first.svg"
 ```
-
-Run it / 运行：
-
-```bash
-vgl sunset.vgl
-```
-
-This code is a **generation blueprint** — change a color variable, adjust mountain count, or swap the sun position, and the entire image updates. No pixel-by-pixel editing needed.
-
-这段代码是一个**生成蓝图**——修改一个颜色变量、调整山脉数量或移动太阳位置，整张图片就会更新。无需逐像素编辑。
 
 ---
 
-## Learn the Language · 学习语言
+## Language · 语言速览
 
-| Resource · 资源 | Description · 说明 |
-|----------------|-------------------|
-| [📘 VGL 快速入门](docs/VGL-快速入门.md) | 中文教程：从零到上手，12 个步骤 + 进阶技巧 |
-| [📕 VGL Quick Reference](docs/VGL-Quick-Reference.md) | English concise language reference for AI (~900 lines) |
-| [📗 完整语法规范](docs/VGL_语法规范%20v0.5.txt) | 中文完整 EBNF 语法 + 版本历史 |
-| [📺 Wiki](https://github.com/Whatsmore-nf/Garden-VGL/wiki) | Development workflow, architecture, version history |
+```vgl
+// 结构：use 引库 → canvas 定尺寸 → seed 定随机 → 绘制 → render 输出
+canvas 800x600
+seed 42
+
+let n = 5                            // 变量
+let cols = ["#ff6b6b", "#4ecdc4"]    // 数组
+
+fn ring(x, y, r, n = 6) {            // 函数 + 默认参数
+    for i in 0..n {                  // 循环
+        let a = i / n * TAU
+        if i % 2 == 0 {              // 条件
+            circle(x + cos(a) * r, y + sin(a) * r, 8, fill: cols[0])
+        } else {
+            circle(x + cos(a) * r, y + sin(a) * r, 8, fill: cols[1])
+        }
+    }
+}
+
+group(translate: [400, 300], rotate: 15) {   // 变换组
+    ring(0, 0, 100)
+    text(0, 6, "VGL", size: 24, fill: "#fff", anchor: "middle")
+}
+
+let pts = []
+for i in 0..30 {
+    push(pts, i * 27)
+    push(pts, 550 + fbm(i * 0.2, 0) * 40)   // 分形噪声
+}
+path(smooth(pts), stroke: "#4ecdc4", width: 2)  // 平滑曲线
+
+render "out.svg"
+```
+
+完整语法见 [快速入门](docs/VGL-快速入门.md) 与 [Quick Reference](docs/VGL-Quick-Reference.md)。
+
+---
 
 ## Examples · 示例
 
 | Script · 脚本 | Highlights · 亮点 |
 |--------|-----------|
-| [demo.vgl](examples/demo.vgl) | Basic drawing primitives / 基础绘图 |
-| [rings.vgl](examples/rings.vgl) | Concentric circle patterns / 同心圆 |
-| [v07_demo.vgl](examples/v07_demo.vgl) | Standard library / 标准库演示 |
-| [v075_demo.vgl](examples/v075_demo.vgl) | Drawing primitives + material presets / 绘图原语 + 材质预设 |
-| [v08_demo.vgl](examples/v08_demo.vgl) | v0.8: gradients, transforms, clipping, text, Perlin noise |
-| [v09_demo.vgl](examples/v09_demo.vgl) | v0.9: bitwise ops, match, enum, class, modules, sRGB linear |
-| [showcase_semantic.vgl](examples/showcase_semantic.vgl) | **v1.0: semantic generation showcase** — sunset scene using lib/ standard library / 语义化生成展示 |
+| [smoke.vgl](examples/smoke.vgl) | 语言冒烟测试：全部语法特性 |
+| [landscape.vgl](examples/landscape.vgl) | 黄昏山水湖景：palette/sun/mountains/water/forest/fog |
+| [night_aurora.vgl](examples/night_aurora.vgl) | 极光雪夜：stars/aurora/moon/snow/conifer |
 
 ---
 
-## CLI · 命令行
+## Project Layout · 项目结构
 
-```bash
-# Run a VGL script · 运行 VGL 脚本
-vgl [--continue-on-error] <file.vgl>
-
-# Semantic replicate (recommended) · 语义化复刻（推荐）
-# 分析图像结构，生成可编辑的语义化生成蓝图（~1KB / 40行）
-vgl replicate --mode semantic <input.png> <output.vgl>
-
-# Legacy modes · 传统模式
-vgl replicate --mode pixel <input.png> <output.vgl>
-vgl replicate --mode block <input.png> <output.vgl> [--block-size 16]
-vgl replicate --mode progressive <input.png> <output.vgl> [--layers 32,8,1] [--threshold 30]
+```
+src/
+  lexer.rs    # 词法分析
+  parser.rs   # 递归下降语法分析
+  ast.rs      # AST + 环境
+  interp.rs   # 树遍历解释器 + 内建绘图函数
+  scene.rs    # 矢量场景图（元素/组/defs）
+  svg.rs      # SVG 序列化
+  noise.rs    # xorshift64* + 柏林噪声 / fbm
+lib/          # 语义库（VGL 自举编写）
+examples/     # 示例脚本与生成结果
 ```
 
-### Semantic Replicate vs Progressive · 语义化复刻 vs 渐进法
+## Design Philosophy · 设计理念
 
-| | Semantic 语义化 | Progressive 渐进法 |
-|---|---|---|
-| **Output size** | ~1 KB / 40 lines | ~2.8 MB / 65,000 lines |
-| **Compression** | **2800x smaller** | baseline |
-| **AI-editable** | ✅ Yes — variables, functions, clear structure | ❌ No — raw pixel coordinates |
-| **Visual fidelity** | Semantic approximation | Near-lossless |
-| **Use case** | AI editing, creative iteration | Pixel-perfect archival |
-
-Semantic mode analyzes the image (K-means color clustering, horizon detection, brightness gradient, color temperature) and generates VGL code using the `lib/` semantic standard library. The output is a readable, editable generation blueprint.
-
-语义化模式分析图像（K-means 颜色聚类、地平线检测、亮度梯度、色温分类），使用 `lib/` 语义化标准库生成 VGL 代码。输出是可读、可编辑的生成蓝图。
-
----
-
-## Project Philosophy · 设计理念
-
-| English | 中文 |
-|---------|------|
-| **Living Blueprint**: Code describes *how* to generate, not *what each pixel is* — variables, functions, and materials make every parameter editable | **活的蓝图**：代码描述"如何生成"，而非"每个像素是什么"——变量、函数、材质让每个参数都可编辑 |
-| **AI-Native**: Designed for AI understanding and procedural editing — semantic replicate produces 1KB of readable code instead of 65K lines of coordinates | **AI 原生**：为 AI 理解和程序化编辑而设计——语义化复刻生成 1KB 可读代码而非 65K 行坐标 |
-| **Semantic Library**: `lib/` standard library provides high-level scene primitives (sky, terrain, water, vegetation, atmosphere) | **语义化标准库**：`lib/` 标准库提供高层场景原语（天空、地形、水面、植被、大气） |
-| **Lightweight**: Single Rust binary, no GPU, no heavy ML frameworks | **轻量**：纯 Rust 单文件，无 GPU 依赖，无重型 AI 框架 |
-| **Quality**: SDF anti-aliasing, premultiplied alpha, sub-pixel scanlines, sRGB linear workflow | **质量**：SDF 抗锯齿、premultiply 合成、子像素精度、sRGB 线性工作流 |
-
----
+| 中文 | English |
+|------|---------|
+| **矢量优先**：精度即 SVG 精度，无限缩放，浏览器/编辑器/AI 全部原生支持 | **Vector-first**: precision is SVG precision; infinitely scalable, natively supported everywhere |
+| **活的蓝图**：代码描述"如何生成"，改参数即改画面，永不逐像素修补 | **Living blueprint**: code describes *how to generate*; tweak a parameter, not pixels |
+| **确定性**：同一 seed 必得同一结果，生成过程可复现、可调试 | **Deterministic**: same seed, same image — reproducible and debuggable |
+| **为 AI 而生**：精简语法 + 语义命名，AI 读写代码即读写画面 | **AI-native**: minimal syntax + semantic names; reading code = reading the image |
 
 ## Version History · 版本历史
 
-| Version · 版本 | Theme · 主题 |
+| Version | Theme · 主题 |
 |---------|-------|
-| v0.1–v0.2.1 | Python prototype / Python 原型期 |
-| v0.3 | Control flow & geometry / 控制流与几何 |
-| v0.4 | Block scoping / 块作用域 |
-| v0.5 | Data structures & rendering / 数据结构与渲染 |
-| v0.55 | Rust rewrite + floating-point canvas / Rust 重构 + 浮点画布 |
-| v0.6 | Image replication toolchain / 图像复刻工具链 |
-| v0.7 | Standard library expansion / 标准库扩展 |
-| v0.75 | Drawing primitives + material presets / 绘图原语 + 材质预设 |
-| **v0.8** | **Image quality leap** (SDF AA, premultiply, gradients, transform, text) |
-| **v0.9** | **Language completeness** (bitwise, match, enum, class, modules, sRGB linear) |
-| **v1.0** | **Semantic generation** — `lib/` standard library (6 modules, 50+ scene primitives), semantic replicate mode, `width()`/`height()` builtins |
-
----
+| v0.1–v0.9 | 光栅渲染时代：Python 原型 → Rust 重写 → SDF 抗锯齿、材质、类与模块 |
+| v1.0 | 语义库 + 图像复刻（replicate）工具链 |
+| **v2.0** | **全面转向矢量**：重写语法（精简为 ~20 关键字）、输出 SVG、删除光栅管线 / C++ 实现 / replicate，语义库全部矢量重写 |
 
 ## License · 许可证
 
